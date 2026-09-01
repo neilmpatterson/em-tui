@@ -196,7 +196,6 @@ against `~/Projects/composer`, not yet built:
 - GitLab merge-request metrics (PR cycle time, review response time, PR size).
   `renderMergeRequests()` is a placeholder seam waiting on API access.
 - Obsidian vault sync, config-driven.
-- Tune on real data: is `Bug Fix Needed` better as `rework` (current) or
-  `blocked`? Also the dominant-phase drill-down caps at 15 tickets and the
+- Tune on real data: the dominant-phase drill-down caps at 15 tickets and the
   slowest-tickets point uses 2× median — both are guesses.
 - No tests exist outside `internal/tui/` and `internal/config/`.

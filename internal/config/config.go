@@ -44,6 +44,9 @@ func (t TeamConfig) EffectiveWatchStatuses() []string {
 // actually in use on this Jira instance. The split that earns its keep is queue
 // vs active: "Ready for QA" and "Testing" are both category In Progress, but one
 // is a ticket waiting for a person and the other is a person working.
+//
+// "Bug Fix Needed" is rework, confirmed by Neil: the time is work attributable
+// to the change, not a queue, so it is not counted toward the wait total.
 var defaultPhases = map[string]string{
 	"In Progress":    "dev",
 	"Code Review":    "review",
