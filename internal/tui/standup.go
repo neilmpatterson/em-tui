@@ -380,7 +380,7 @@ func (m StandupModel) handleMenuKey(msg tea.KeyMsg) (StandupModel, tea.Cmd) {
 	n := len(m.activeSections)
 	switch msg.String() {
 	case "esc", "q":
-		return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+		return m, func() tea.Msg { return GoBack{} }
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--

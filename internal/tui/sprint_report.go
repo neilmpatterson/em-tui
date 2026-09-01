@@ -152,7 +152,7 @@ func (m SprintReportModel) handleKey(msg tea.KeyMsg) (SprintReportModel, tea.Cmd
 		return m.handleReportKey(msg)
 	default:
 		if msg.String() == "q" || msg.String() == "esc" {
-			return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+			return m, func() tea.Msg { return GoBack{} }
 		}
 	}
 	return m, nil
@@ -162,7 +162,7 @@ func (m SprintReportModel) handleListKey(msg tea.KeyMsg) (SprintReportModel, tea
 	n := len(m.sprints)
 	switch msg.String() {
 	case "q", "esc":
-		return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+		return m, func() tea.Msg { return GoBack{} }
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -188,7 +188,7 @@ func (m SprintReportModel) handleReportKey(msg tea.KeyMsg) (SprintReportModel, t
 		m.state = srStateSprintList
 		return m, nil
 	case "q":
-		return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+		return m, func() tea.Msg { return GoBack{} }
 	}
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)

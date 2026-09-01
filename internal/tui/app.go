@@ -28,6 +28,9 @@ type NavigateTo struct {
 	Payload any
 }
 
+// GoBack returns to the main menu without recreating it, preserving team/person selection.
+type GoBack struct{}
+
 // memberPayload carries both team and member indices for member-scoped screens.
 type memberPayload struct{ team, member int }
 
@@ -98,6 +101,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return a, tea.Quit
 		}
+
+	case GoBack:
+		a.screen = ScreenMainMenu
+		return a, nil
 
 	case NavigateTo:
 		return a.handleNavigate(msg)

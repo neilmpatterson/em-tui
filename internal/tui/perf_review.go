@@ -26,7 +26,7 @@ func (m PerfReviewModel) Init() tea.Cmd { return nil }
 func (m PerfReviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
 		if key.String() == "esc" || key.String() == "q" {
-			return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+			return m, func() tea.Msg { return GoBack{} }
 		}
 	}
 	return m, nil

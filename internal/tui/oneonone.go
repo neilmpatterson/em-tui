@@ -220,7 +220,7 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "esc":
-			return m, func() tea.Msg { return NavigateTo{Screen: ScreenMainMenu} }
+			return m, func() tea.Msg { return GoBack{} }
 		default:
 			if m.state == ooStateReport {
 				var cmd tea.Cmd
@@ -246,7 +246,11 @@ func (m *OneOnOneModel) finishIfDone() {
 }
 
 func (m OneOnOneModel) View() string {
-	header := titleStyle.Render("1:1 — "+m.member.DisplayName) + "\n"
+	teamLabel := ""
+	if m.team.Name != "" {
+		teamLabel = "  ·  " + m.team.Name
+	}
+	header := titleStyle.Render("1:1 — "+m.member.DisplayName+teamLabel) + "\n"
 	rule := strings.Repeat("─", min(m.width, 60)) + "\n"
 
 	switch m.state {
