@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/yaml"
@@ -214,6 +215,18 @@ func marshalYAML(cfg *Config) string {
 			sb.WriteString("    watch_statuses:\n")
 			for _, s := range t.WatchStatuses {
 				sb.WriteString(fmt.Sprintf("      - %q\n", s))
+			}
+		}
+		if len(t.Phases) > 0 {
+			// Sorted so a save doesn't reshuffle the file on every write.
+			names := make([]string, 0, len(t.Phases))
+			for n := range t.Phases {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			sb.WriteString("    phases:\n")
+			for _, n := range names {
+				sb.WriteString(fmt.Sprintf("      %q: %q\n", n, t.Phases[n]))
 			}
 		}
 	}
