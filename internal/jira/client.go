@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	gojira "github.com/andygrunwald/go-jira"
@@ -426,4 +427,424 @@ func truncateDate(s string) string {
 		return s[:10]
 	}
 	return s
+}
+
+// --- Sprint list and report ---
+
+// SprintsResult carries a merged list of sprints (active first, then recent closed).
+type SprintsResult struct {
+	Sprints []domain.Sprint
+	Err     error
+}
+
+// SprintReportResult carries the full sprint report from the GreenHopper API.
+type SprintReportResult struct {
+	Data domain.SprintReportData
+	Err  error
+}
+
+// FetchRecentSprints fetches the active sprint (if any) plus the most recently closed
+// sprints for a board, returning them merged with active first.
+func (c *Client) FetchRecentSprints(boardID, limit int) tea.Cmd {
+	return func() tea.Msg {
+		var sprints []domain.Sprint
+
+		activeURL := fmt.Sprintf("%s/rest/agile/1.0/board/%d/sprint?state=active&maxResults=1", c.baseURL, boardID)
+		if active, err := c.fetchSprintPage(activeURL); err == nil {
+			sprints = append(sprints, active...)
+		}
+
+		// Paginate all closed sprints so we get the most recent, not just the first page.
+		closed := c.fetchAllClosedSprints(boardID)
+		sort.Slice(closed, func(i, j int) bool {
+			return closed[i].EndDate > closed[j].EndDate
+		})
+		if len(closed) > limit {
+			closed = closed[:limit]
+		}
+		sprints = append(sprints, closed...)
+
+		if len(sprints) == 0 {
+			return SprintsResult{Err: fmt.Errorf("no sprints found for board %d", boardID)}
+		}
+		return SprintsResult{Sprints: sprints}
+	}
+}
+
+// fetchAllClosedSprints paginates the Agile API to collect every closed sprint for a board.
+func (c *Client) fetchAllClosedSprints(boardID int) []domain.Sprint {
+	const pageSize = 50
+	var all []domain.Sprint
+	startAt := 0
+
+	for {
+		url := fmt.Sprintf(
+			"%s/rest/agile/1.0/board/%d/sprint?state=closed&maxResults=%d&startAt=%d",
+			c.baseURL, boardID, pageSize, startAt,
+		)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			break
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			break
+		}
+
+		if resp.StatusCode >= 400 {
+			resp.Body.Close()
+			break
+		}
+
+		var payload struct {
+			Values []struct {
+				ID        int    `json:"id"`
+				Name      string `json:"name"`
+				State     string `json:"state"`
+				StartDate string `json:"startDate"`
+				EndDate   string `json:"endDate"`
+			} `json:"values"`
+			IsLast bool `json:"isLast"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if err != nil {
+			break
+		}
+
+		for _, v := range payload.Values {
+			start, end := v.StartDate, v.EndDate
+			if len(start) >= 10 {
+				start = start[:10]
+			}
+			if len(end) >= 10 {
+				end = end[:10]
+			}
+			all = append(all, domain.Sprint{
+				ID:        v.ID,
+				Name:      v.Name,
+				State:     v.State,
+				StartDate: start,
+				EndDate:   end,
+			})
+		}
+
+		if payload.IsLast || len(payload.Values) == 0 {
+			break
+		}
+		startAt += len(payload.Values)
+	}
+	return all
+}
+
+// fetchSprintPage fetches a page of sprints from the given Agile API URL.
+func (c *Client) fetchSprintPage(url string) ([]domain.Sprint, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Values []struct {
+			ID        int    `json:"id"`
+			Name      string `json:"name"`
+			State     string `json:"state"`
+			StartDate string `json:"startDate"`
+			EndDate   string `json:"endDate"`
+		} `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+
+	sprints := make([]domain.Sprint, 0, len(payload.Values))
+	for _, v := range payload.Values {
+		start, end := v.StartDate, v.EndDate
+		if len(start) >= 10 {
+			start = start[:10]
+		}
+		if len(end) >= 10 {
+			end = end[:10]
+		}
+		sprints = append(sprints, domain.Sprint{
+			ID:        v.ID,
+			Name:      v.Name,
+			State:     v.State,
+			StartDate: start,
+			EndDate:   end,
+		})
+	}
+	return sprints, nil
+}
+
+// ghIssueJSON is the Jira GreenHopper sprint report issue shape.
+type ghIssueJSON struct {
+	Key          string `json:"key"`
+	Summary      string `json:"summary"`
+	AssigneeName string `json:"assigneeName"`
+	StatusName   string `json:"statusName"`
+	EstimateStatistic struct {
+		StatFieldValue *struct {
+			Value *float64 `json:"value"`
+		} `json:"statFieldValue"`
+	} `json:"estimateStatistic"`
+	CurrentEstimateStatistic struct {
+		StatFieldValue *struct {
+			Value *float64 `json:"value"`
+		} `json:"statFieldValue"`
+	} `json:"currentEstimateStatistic"`
+}
+
+// toCompact converts a GreenHopper issue to SprintIssueCompact. spMap provides a
+// fallback story-point value (from the Agile board API) for when GreenHopper's
+// estimate statistic is null.
+func (g ghIssueJSON) toCompact(spMap map[string]float64) domain.SprintIssueCompact {
+	var initialSP, finalSP *float64
+	if g.EstimateStatistic.StatFieldValue != nil {
+		initialSP = g.EstimateStatistic.StatFieldValue.Value
+	}
+	if g.CurrentEstimateStatistic.StatFieldValue != nil {
+		finalSP = g.CurrentEstimateStatistic.StatFieldValue.Value
+	}
+	if finalSP == nil {
+		if sp, ok := spMap[g.Key]; ok {
+			finalSP = &sp
+		}
+	}
+	return domain.SprintIssueCompact{
+		Key:       g.Key,
+		Summary:   g.Summary,
+		Assignee:  g.AssigneeName,
+		Status:    g.StatusName,
+		InitialSP: initialSP,
+		FinalSP:   finalSP,
+	}
+}
+
+// fetchSprintIssueSP fetches the story_points field for every issue in a sprint via
+// the Agile board API. Used as a fallback when GreenHopper estimate statistics are null.
+func (c *Client) fetchSprintIssueSP(boardID, sprintID int) map[string]float64 {
+	result := make(map[string]float64)
+	const pageSize = 100
+	startAt := 0
+
+	for {
+		url := fmt.Sprintf(
+			"%s/rest/agile/1.0/board/%d/sprint/%d/issue?maxResults=%d&startAt=%d&fields=story_points",
+			c.baseURL, boardID, sprintID, pageSize, startAt,
+		)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			break
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			break
+		}
+		if resp.StatusCode >= 400 {
+			resp.Body.Close()
+			break
+		}
+
+		var payload struct {
+			Total  int `json:"total"`
+			Issues []struct {
+				Key    string `json:"key"`
+				Fields struct {
+					StoryPoints *float64 `json:"story_points"`
+				} `json:"fields"`
+			} `json:"issues"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if err != nil || len(payload.Issues) == 0 {
+			break
+		}
+
+		for _, i := range payload.Issues {
+			if i.Fields.StoryPoints != nil {
+				result[i.Key] = *i.Fields.StoryPoints
+			}
+		}
+
+		startAt += len(payload.Issues)
+		if startAt >= payload.Total {
+			break
+		}
+	}
+	return result
+}
+
+// ghEstimateSum holds a GreenHopper story-point sum which may be null.
+type ghEstimateSum struct {
+	Value *float64 `json:"value"`
+}
+
+// FetchSprintReport fetches the sprint report from the GreenHopper API.
+// The provided sprint is embedded in the result so we avoid re-parsing GreenHopper's
+// non-standard date format.
+func (c *Client) FetchSprintReport(boardID int, sprint domain.Sprint) tea.Cmd {
+	return func() tea.Msg {
+		url := fmt.Sprintf(
+			"%s/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId=%d&sprintId=%d",
+			c.baseURL, boardID, sprint.ID,
+		)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return SprintReportResult{Err: err}
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return SprintReportResult{Err: err}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			return SprintReportResult{Err: fmt.Errorf("HTTP %d fetching sprint report", resp.StatusCode)}
+		}
+
+		var payload struct {
+			Contents struct {
+				CompletedIssues       []ghIssueJSON   `json:"completedIssues"`
+				NotCompleted          []ghIssueJSON   `json:"issuesNotCompletedInCurrentSprint"`
+				PuntedIssues          []ghIssueJSON   `json:"puntedIssues"`
+				AddedDuringSprint     map[string]bool `json:"issueKeysAddedDuringSprint"`
+				CompletedInitialSum   ghEstimateSum   `json:"completedIssuesInitialEstimateSum"`
+				CompletedFinalSum     ghEstimateSum   `json:"completedIssueEstimateSum"`
+				IncompletedInitialSum ghEstimateSum   `json:"incompletedIssuesInitialEstimateSum"`
+				IncompletedFinalSum   ghEstimateSum   `json:"incompletedIssuesEstimateSum"`
+				AllIssuesSum          ghEstimateSum   `json:"allIssuesEstimateSum"`
+			} `json:"contents"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return SprintReportResult{Err: err}
+		}
+
+		cnts := payload.Contents
+
+		// Fetch per-issue SP from the Agile board API as a fallback for when
+		// GreenHopper's estimate statistics are null (varies by Jira configuration).
+		spMap := c.fetchSprintIssueSP(boardID, sprint.ID)
+
+		completed := make([]domain.SprintIssueCompact, 0, len(cnts.CompletedIssues))
+		for _, i := range cnts.CompletedIssues {
+			completed = append(completed, i.toCompact(spMap))
+		}
+		notCompleted := make([]domain.SprintIssueCompact, 0, len(cnts.NotCompleted))
+		for _, i := range cnts.NotCompleted {
+			notCompleted = append(notCompleted, i.toCompact(spMap))
+		}
+		punted := make([]domain.SprintIssueCompact, 0, len(cnts.PuntedIssues))
+		for _, i := range cnts.PuntedIssues {
+			punted = append(punted, i.toCompact(spMap))
+		}
+
+		// Use GreenHopper aggregate sums when available; otherwise compute from per-issue SP.
+		completedSP := cnts.CompletedFinalSum.Value
+		if completedSP == nil {
+			completedSP = spSumOf(completed)
+		}
+		incompleteSP := cnts.IncompletedFinalSum.Value
+		if incompleteSP == nil {
+			incompleteSP = spSumOf(notCompleted)
+		}
+
+		// PlannedSP: initial estimate sum from GreenHopper, or approximate as current SP
+		// of issues that were in the sprint at start (excludes mid-sprint additions).
+		plannedSP := sumSP(cnts.CompletedInitialSum.Value, cnts.IncompletedInitialSum.Value)
+		if plannedSP == nil {
+			var total float64
+			hasAny := false
+			for _, iss := range append(completed, notCompleted...) {
+				if !cnts.AddedDuringSprint[iss.Key] && iss.FinalSP != nil {
+					total += *iss.FinalSP
+					hasAny = true
+				}
+			}
+			if hasAny {
+				plannedSP = &total
+			}
+		}
+
+		// SP added mid-sprint and removed (punted).
+		var addedSP *float64
+		if len(cnts.AddedDuringSprint) > 0 {
+			var total float64
+			hasAny := false
+			for _, iss := range append(completed, notCompleted...) {
+				if cnts.AddedDuringSprint[iss.Key] && iss.FinalSP != nil {
+					total += *iss.FinalSP
+					hasAny = true
+				}
+			}
+			if hasAny {
+				addedSP = &total
+			}
+		}
+		removedSP := spSumOf(punted)
+
+		data := domain.SprintReportData{
+			Sprint:         sprint,
+			Completed:      completed,
+			NotCompleted:   notCompleted,
+			Punted:         punted,
+			AddedMidSprint: cnts.AddedDuringSprint,
+			PlannedSP:      plannedSP,
+			CompletedSP:    completedSP,
+			IncompleteSP:   incompleteSP,
+			TotalEndSP:     cnts.AllIssuesSum.Value,
+			AddedSP:        addedSP,
+			RemovedSP:      removedSP,
+		}
+		return SprintReportResult{Data: data}
+	}
+}
+
+// spSumOf sums FinalSP across a slice of issues; returns nil if none have SP set.
+func spSumOf(issues []domain.SprintIssueCompact) *float64 {
+	var total float64
+	hasAny := false
+	for _, iss := range issues {
+		if iss.FinalSP != nil {
+			total += *iss.FinalSP
+			hasAny = true
+		}
+	}
+	if !hasAny {
+		return nil
+	}
+	return &total
+}
+
+// sumSP adds two nullable SP values; returns nil only if both inputs are nil.
+func sumSP(a, b *float64) *float64 {
+	if a == nil && b == nil {
+		return nil
+	}
+	var va, vb float64
+	if a != nil {
+		va = *a
+	}
+	if b != nil {
+		vb = *b
+	}
+	v := va + vb
+	return &v
 }

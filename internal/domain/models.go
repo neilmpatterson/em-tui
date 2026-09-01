@@ -45,3 +45,29 @@ type GitCommit struct {
 	Message string
 	Repo    string // base name of the repository directory
 }
+
+// SprintIssueCompact is a lightweight issue record from the GreenHopper sprint report API.
+type SprintIssueCompact struct {
+	Key       string
+	Summary   string
+	Assignee  string
+	Status    string
+	InitialSP *float64 // estimate at sprint start; nil if not estimated
+	FinalSP   *float64 // estimate at sprint end
+}
+
+// SprintReportData holds sprint report data from the GreenHopper API.
+type SprintReportData struct {
+	Sprint         Sprint
+	Completed      []SprintIssueCompact
+	NotCompleted   []SprintIssueCompact
+	Punted         []SprintIssueCompact
+	AddedMidSprint map[string]bool // issue keys added after sprint start
+	// SP totals; nil means the board has no story points field configured
+	PlannedSP    *float64 // committed SP at sprint start (before mid-sprint changes)
+	CompletedSP  *float64 // SP completed by sprint end
+	IncompleteSP *float64 // SP not completed by sprint end
+	TotalEndSP   *float64 // all issues combined at end of sprint
+	AddedSP      *float64 // SP added to sprint after start (mid-sprint scope additions)
+	RemovedSP    *float64 // SP removed from sprint (punted issues)
+}

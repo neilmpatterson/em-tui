@@ -157,7 +157,7 @@ func (a App) handleNavigate(msg NavigateTo) (tea.Model, tea.Cmd) {
 		return a, a.oneOnOne.Init()
 	case ScreenSprintReport:
 		teamIdx, _ := msg.Payload.(int)
-		a.sprintRpt = NewSprintReport(a.cfg, teamIdx, a.jiraClient)
+		a.sprintRpt = NewSprintReport(a.cfg, teamIdx, a.jiraClient, a.width, a.height)
 		return a, a.sprintRpt.Init()
 	case ScreenPerfReview:
 		p, _ := msg.Payload.(memberPayload)
