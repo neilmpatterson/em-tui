@@ -132,10 +132,12 @@ const (
 	PhaseDone
 )
 
-// PhaseOrder lists phases in workflow order for rendering.
+// PhaseOrder lists phases in the order work actually flows through them, so the
+// breakdown reads top to bottom the way the ticket moved. Queue phases precede
+// the active phase they feed.
 var PhaseOrder = []Phase{
 	PhaseTodo, PhaseDev, PhaseReview, PhaseAwaitingMerge,
-	PhaseQA, PhaseAwaitingQA, PhaseRework, PhaseBlocked, PhaseDone, PhaseUnknown,
+	PhaseAwaitingQA, PhaseQA, PhaseRework, PhaseBlocked, PhaseDone, PhaseUnknown,
 }
 
 func (p Phase) String() string {
@@ -281,6 +283,10 @@ type MemberFlow struct {
 	ReopenedEvents int
 	QABounceIssues int
 	QABounceEvents int
+
+	// Issues retains the per-issue breakdown, including still-open ones, so the
+	// talking points can drill into which tickets they are actually about.
+	Issues []IssueCycle
 
 	DoneByWeek        []WeekCount
 	ThroughputPerWeek float64

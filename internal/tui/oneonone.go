@@ -3,6 +3,8 @@ package tui
 import (
 	"fmt"
 	"math"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -23,7 +25,35 @@ const (
 	ooStateLoading ooState = iota
 	ooStateReport
 	ooStateError
+	ooStateDetail // drill-down table for one talking point
 )
+
+// ooFocus is which part of the report the keyboard is driving. j/k means scroll
+// by default; tab hands it to the talking-point list so the same keys select.
+type ooFocus int
+
+const (
+	ooFocusScroll ooFocus = iota
+	ooFocusPoints
+)
+
+// ticketRef is one row in a talking-point drill-down.
+type ticketRef struct {
+	Key     string
+	Summary string
+	Status  string
+	Detail  string // the metric that put it on this list, e.g. "2 bounces", "27d"
+}
+
+// talkingPoint is one generated observation. Tickets is nil for points with no
+// specific issues behind them (velocity trends, commit cadence), and those are
+// skipped when selecting, so the cursor only ever lands on something openable.
+type talkingPoint struct {
+	Lines      []string
+	Title      string
+	DetailHead string // column header for the Detail field
+	Tickets    []ticketRef
+}
 
 type OneOnOneModel struct {
 	cfg        *config.Config
@@ -53,6 +83,16 @@ type OneOnOneModel struct {
 	flow                domain.MemberFlow
 	openAges            []domain.OpenIssueAge
 	changelogWindowFrom time.Time
+
+	// Computed once when loading finishes, not per keystroke: the report
+	// re-renders on every selection move.
+	points    []talkingPoint
+	drillable []int // indices into points that have tickets behind them
+
+	focus     ooFocus
+	selected  int // index into drillable
+	detailIdx int // index into points, for the open detail view
+	detailRow int
 
 	viewport viewport.Model
 	ready    bool
@@ -243,18 +283,131 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "esc":
-			return m, func() tea.Msg { return GoBack{} }
-		default:
-			if m.state == ooStateReport {
-				var cmd tea.Cmd
-				m.viewport, cmd = m.viewport.Update(msg)
-				return m, cmd
-			}
-		}
+		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+func (m OneOnOneModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Detail view has its own key map; esc backs out to the report rather than
+	// leaving the screen entirely.
+	if m.state == ooStateDetail {
+		rows := 0
+		if m.detailIdx < len(m.points) {
+			rows = len(m.points[m.detailIdx].Tickets)
+		}
+		switch key {
+		case "esc", "q", "left", "h":
+			m.state = ooStateReport
+			m.viewport.SetContent(m.renderContent())
+			return m, nil
+		case "j", "down":
+			if m.detailRow < rows-1 {
+				m.detailRow++
+			}
+			return m, nil
+		case "k", "up":
+			if m.detailRow > 0 {
+				m.detailRow--
+			}
+			return m, nil
+		case "g", "home":
+			m.detailRow = 0
+			return m, nil
+		case "G", "end":
+			m.detailRow = max(0, rows-1)
+			return m, nil
+		case "enter", "o":
+			if m.detailRow < rows {
+				url := strings.TrimRight(m.cfg.Jira.BaseURL, "/") + "/browse/" +
+					m.points[m.detailIdx].Tickets[m.detailRow].Key
+				return m, openInBrowser(url)
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
+	switch key {
+	case "q":
+		return m, func() tea.Msg { return GoBack{} }
+
+	case "esc":
+		// Esc first drops focus back to scrolling, so it takes two presses to
+		// leave the screen from selection mode rather than one surprising one.
+		if m.focus == ooFocusPoints {
+			m.focus = ooFocusScroll
+			m.viewport.SetContent(m.renderContent())
+			return m, nil
+		}
+		return m, func() tea.Msg { return GoBack{} }
+
+	case "tab", "shift+tab":
+		if m.state != ooStateReport || len(m.drillable) == 0 {
+			return m, nil
+		}
+		if m.focus == ooFocusPoints {
+			m.focus = ooFocusScroll
+		} else {
+			m.focus = ooFocusPoints
+			m.selected = 0
+			m.viewport.GotoTop() // the points are at the top; show what's selected
+		}
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	}
+
+	if m.focus == ooFocusPoints && m.state == ooStateReport {
+		switch key {
+		case "j", "down":
+			if m.selected < len(m.drillable)-1 {
+				m.selected++
+			}
+			m.viewport.SetContent(m.renderContent())
+			return m, nil
+		case "k", "up":
+			if m.selected > 0 {
+				m.selected--
+			}
+			m.viewport.SetContent(m.renderContent())
+			return m, nil
+		case "enter", "l", "right":
+			if m.selected < len(m.drillable) {
+				m.detailIdx = m.drillable[m.selected]
+				m.detailRow = 0
+				m.state = ooStateDetail
+			}
+			return m, nil
+		}
+	}
+
+	if m.state == ooStateReport {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// openInBrowser launches the platform URL handler. Errors are swallowed: a
+// failure here should never take down the TUI, and the key is also an OSC 8
+// hyperlink the user can click.
+func openInBrowser(url string) tea.Cmd {
+	return func() tea.Msg {
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", url)
+		case "windows":
+			cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		default:
+			cmd = exec.Command("xdg-open", url)
+		}
+		_ = cmd.Start()
+		return nil
+	}
 }
 
 // finishIfDone transitions to ooStateReport once all data is loaded.
@@ -264,6 +417,23 @@ func (m *OneOnOneModel) finishIfDone() {
 		return
 	}
 	m.state = ooStateReport
+
+	now := time.Now()
+	stats := memberStatsFromReports(m.member.DisplayName, m.sprintReports)
+	recentAvg, histAvg, trend := spTrend(stats)
+	weeks := commitsByWeek(m.commits, now, 8)
+	avg, thisWeek, active, _ := commitCadence(weeks)
+	carry := carryoverStats(m.member.DisplayName, stats, m.sprintReports)
+	m.points = m.buildTalkingPoints(stats, trend, recentAvg, histAvg, carry,
+		belowAverageCommits(weeks, avg, thisWeek, active, now))
+
+	m.drillable = m.drillable[:0]
+	for i, p := range m.points {
+		if len(p.Tickets) > 0 {
+			m.drillable = append(m.drillable, i)
+		}
+	}
+
 	if m.ready {
 		m.viewport.SetContent(m.renderContent())
 		m.viewport.GotoTop()
@@ -283,13 +453,27 @@ func (m OneOnOneModel) View() string {
 		return header + rule + "\n" + warnStyle.Render(m.errMsg) + "\n"
 	case ooStateLoading:
 		return header + rule + "\n" + dimStyle.Render("Loading...") + "\n"
+	case ooStateDetail:
+		body := m.renderDetail()
+		// Pad to the viewport height so the footer doesn't jump up the screen on
+		// a short table.
+		if n := m.viewport.Height - strings.Count(body, "\n"); n > 0 {
+			body += strings.Repeat("\n", n)
+		}
+		return header + rule + body +
+			"\n" + dimStyle.Render("j/k select   enter open in browser   esc back to report")
 	}
 
 	if !m.ready {
 		return header + rule + "\n" + m.renderContent()
 	}
-	footer := "\n" + dimStyle.Render("j/k scroll   q back")
-	return header + rule + m.viewport.View() + footer
+	hints := "j/k scroll   q back"
+	if m.focus == ooFocusPoints {
+		hints = "j/k select point   enter open   tab back to scroll   esc cancel"
+	} else if len(m.drillable) > 0 {
+		hints = "j/k scroll   tab select talking point   q back"
+	}
+	return header + rule + m.viewport.View() + "\n" + dimStyle.Render(hints)
 }
 
 // ooFetchOrLoadCached checks the disk cache before hitting the API for closed sprints.
@@ -612,6 +796,7 @@ func (m OneOnOneModel) computeFlow(changelogs []domain.IssueChangelog, openKeys 
 			f.QABounceEvents += c.QABounces
 		}
 		f.ReviewDays = append(f.ReviewDays, m.phasePasses(cl, domain.PhaseReview)...)
+		f.Issues = append(f.Issues, c)
 
 		if open {
 			continue
@@ -936,6 +1121,15 @@ func inProgressCount(issues []domain.JiraIssue) int {
 	return n
 }
 
+// plural returns the "s" suffix for count, so generated talking points read
+// naturally when spoken aloud in a 1:1.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 // fmtDays renders a day count compactly: "6h", "1.4d", "12d".
 func fmtDays(d float64) string {
 	switch {
@@ -956,17 +1150,16 @@ func (m OneOnOneModel) renderContent() string {
 	var sb strings.Builder
 	now := time.Now()
 
-	// Compute everything up front. Talking Points renders first but depends on
+	// Everything is computed up front. Talking Points renders first but depends on
 	// every section below it, so nothing may compute inline during rendering.
 	stats := memberStatsFromReports(m.member.DisplayName, m.sprintReports)
 	recentAvg, histAvg, trend := spTrend(stats)
 	weeks := commitsByWeek(m.commits, now, 8)
 	avgCommits, thisWeek, activeWeeks, totalCommits := commitCadence(weeks)
 	commitsLow := belowAverageCommits(weeks, avgCommits, thisWeek, activeWeeks, now)
-	inProg := inProgressCount(m.openIssues)
 	carry := carryoverStats(m.member.DisplayName, stats, m.sprintReports)
 
-	sb.WriteString(m.renderTalkingPoints(trend, recentAvg, histAvg, carry, commitsLow, inProg))
+	sb.WriteString(m.renderTalkingPoints())
 	sb.WriteString(m.renderCycleTime(carry))
 	sb.WriteString(m.renderVelocity(stats, recentAvg, histAvg, trend))
 	sb.WriteString(m.renderOpenIssues())
@@ -975,59 +1168,271 @@ func (m OneOnOneModel) renderContent() string {
 	return sb.String()
 }
 
-func (m OneOnOneModel) renderTalkingPoints(trend string, recentAvg, histAvg float64,
-	carry domain.CarryoverStats, commitsLow bool, inProg int) string {
+// ticketInfo builds a key → summary/status lookup from data already fetched:
+// open issues carry both, and the sprint reports cover completed ones.
+func (m OneOnOneModel) ticketInfo() map[string]ticketRef {
+	info := map[string]ticketRef{}
+	for _, r := range m.sprintReports {
+		for _, group := range [][]domain.SprintIssueCompact{r.Completed, r.NotCompleted, r.Punted} {
+			for _, iss := range group {
+				if _, seen := info[iss.Key]; !seen {
+					info[iss.Key] = ticketRef{Key: iss.Key, Summary: iss.Summary, Status: iss.Status}
+				}
+			}
+		}
+	}
+	// Open issues win: they are the more current of the two.
+	for _, iss := range m.openIssues {
+		info[iss.Key] = ticketRef{Key: iss.Key, Summary: iss.Summary, Status: iss.Status}
+	}
+	return info
+}
+
+// refsFor turns issue keys into drill-down rows, attaching the metric that put
+// each one on the list. Keys with no known summary still render, since a bare
+// key is more useful during a 1:1 than a silently dropped row.
+func (m OneOnOneModel) refsFor(keys []string, detail func(string) string) []ticketRef {
+	info := m.ticketInfo()
+	out := make([]ticketRef, 0, len(keys))
+	for _, k := range keys {
+		r, ok := info[k]
+		if !ok {
+			r = ticketRef{Key: k, Summary: dimStyle.Render("(not in the sampled sprints)")}
+		}
+		if detail != nil {
+			r.Detail = detail(k)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// buildTalkingPoints generates the observations and the tickets behind each one.
+// Called once when loading finishes: the report re-renders on every selection
+// move, so this must not run per keystroke.
+func (m OneOnOneModel) buildTalkingPoints(stats []domain.MemberSprintStats, trend string,
+	recentAvg, histAvg float64, carry domain.CarryoverStats, commitsLow bool) []talkingPoint {
 
 	f := m.flow
-	var points []string
+	var pts []talkingPoint
+
+	byKey := map[string]domain.IssueCycle{}
+	for _, c := range f.Issues {
+		byKey[c.Key] = c
+	}
 
 	// Lead with the phase breakdown when one non-dev phase dominates: that is the
 	// difference between a coding problem and a queue problem.
 	if top, share := topPhase(f.PhaseShare); share > 0.4 && top != domain.PhaseDev && top != domain.PhaseTodo {
-		points = append(points, fmt.Sprintf(
-			"%.0f%% of cycle time is spent in %s (%s avg). %s",
-			share*100, top, fmtDays(f.AvgPhase[top]),
-			map[bool]string{true: "Queue problem, not a coding problem.", false: "Worth asking what's slow there."}[top.IsWait()]))
-	}
-	if f.IssuesCompleted >= 8 && f.MaxCycleDays > 3*f.P50CycleDays && f.MaxCycleKey != "" {
-		points = append(points, fmt.Sprintf(
-			"%s took %s against a median of %s — worth asking what stalled.",
-			f.MaxCycleKey, fmtDays(f.MaxCycleDays), fmtDays(f.P50CycleDays)))
-	}
-	if f.QABounceIssues > 0 {
-		points = append(points, fmt.Sprintf("%d issue(s) kicked back from QA or review (%d times).",
-			f.QABounceIssues, f.QABounceEvents))
-	}
-	if f.ReopenedIssues > 0 {
-		points = append(points, fmt.Sprintf("%d issue(s) reopened after being marked done.", f.ReopenedIssues))
-	}
-	if trend == "down" {
-		points = append(points, fmt.Sprintf(
-			"Velocity is below average lately (%.0f SP vs %.0f). Worth exploring blockers.", recentAvg, histAvg))
-	}
-	if carry.PooledRate > 0.3 {
-		points = append(points, fmt.Sprintf("Carrying over %.0f%% of committed points across %d sprints.",
-			carry.PooledRate*100, carry.SprintsUsed))
-	}
-	if stale := staleOpenIssues(m.openAges, 14); len(stale) > 0 {
-		points = append(points, fmt.Sprintf("%d open issue(s) have sat in the same status over 14 days.", len(stale)))
-	}
-	if inProg > 5 {
-		points = append(points, fmt.Sprintf("%d items in progress at once — watch for context switching.", inProg))
-	}
-	if commitsLow {
-		points = append(points, "Lighter commit activity this week than the recent average.")
-	}
-	if len(points) == 0 {
-		points = append(points, "No workload, velocity or flow concerns this cycle.")
+		tail := "Worth asking what's slow there."
+		if top.IsWait() {
+			tail = "Queue problem, not a coding problem."
+		}
+		// The worst offenders in that phase, so "which ones?" has an answer.
+		var keys []string
+		for _, c := range f.Issues {
+			if c.Phases[top] > 0 {
+				keys = append(keys, c.Key)
+			}
+		}
+		sort.Slice(keys, func(i, j int) bool { return byKey[keys[i]].Phases[top] > byKey[keys[j]].Phases[top] })
+		if len(keys) > 15 {
+			keys = keys[:15]
+		}
+		pts = append(pts, talkingPoint{
+			Lines: []string{
+				fmt.Sprintf("%.0f%% of cycle time is spent in %s (%s avg).", share*100, top, fmtDays(f.AvgPhase[top])),
+				tail,
+			},
+			Title:      fmt.Sprintf("Longest time in %s", top),
+			DetailHead: "IN PHASE",
+			Tickets:    m.refsFor(keys, func(k string) string { return fmtDays(byKey[k].Phases[top]) }),
+		})
 	}
 
+	if f.IssuesCompleted >= 8 && f.MaxCycleDays > 3*f.P50CycleDays && f.MaxCycleKey != "" {
+		var keys []string
+		for _, c := range f.Issues {
+			if c.CycleDays > 2*f.P50CycleDays {
+				keys = append(keys, c.Key)
+			}
+		}
+		sort.Slice(keys, func(i, j int) bool { return byKey[keys[i]].CycleDays > byKey[keys[j]].CycleDays })
+		pts = append(pts, talkingPoint{
+			Lines: []string{fmt.Sprintf("%s took %s against a median of %s — worth asking what stalled.",
+				f.MaxCycleKey, fmtDays(f.MaxCycleDays), fmtDays(f.P50CycleDays))},
+			Title:      "Slowest tickets",
+			DetailHead: "CYCLE",
+			Tickets:    m.refsFor(keys, func(k string) string { return fmtDays(byKey[k].CycleDays) }),
+		})
+	}
+
+	if f.QABounceIssues > 0 {
+		var keys []string
+		for _, c := range f.Issues {
+			if c.QABounces > 0 {
+				keys = append(keys, c.Key)
+			}
+		}
+		sort.Slice(keys, func(i, j int) bool { return byKey[keys[i]].QABounces > byKey[keys[j]].QABounces })
+		pts = append(pts, talkingPoint{
+			Lines: []string{fmt.Sprintf("%d issue%s kicked back from QA or review (%d times).",
+				f.QABounceIssues, plural(f.QABounceIssues), f.QABounceEvents)},
+			Title:      "Kicked back from QA or review",
+			DetailHead: "BOUNCES",
+			Tickets:    m.refsFor(keys, func(k string) string { return fmt.Sprintf("%d", byKey[k].QABounces) }),
+		})
+	}
+
+	if f.ReopenedIssues > 0 {
+		var keys []string
+		for _, c := range f.Issues {
+			if c.Reopened > 0 {
+				keys = append(keys, c.Key)
+			}
+		}
+		pts = append(pts, talkingPoint{
+			Lines:      []string{fmt.Sprintf("%d issue%s reopened after being marked done.", f.ReopenedIssues, plural(f.ReopenedIssues))},
+			Title:      "Reopened after done",
+			DetailHead: "REOPENS",
+			Tickets:    m.refsFor(keys, func(k string) string { return fmt.Sprintf("%d", byKey[k].Reopened) }),
+		})
+	}
+
+	if stale := staleOpenIssues(m.openAges, 14); len(stale) > 0 {
+		sort.Slice(stale, func(i, j int) bool { return stale[i].DaysInStatus > stale[j].DaysInStatus })
+		ageByKey := map[string]float64{}
+		keys := make([]string, 0, len(stale))
+		for _, a := range stale {
+			ageByKey[a.Key] = a.DaysInStatus
+			keys = append(keys, a.Key)
+		}
+		pts = append(pts, talkingPoint{
+			Lines:      []string{fmt.Sprintf("%d open issue%s sat in the same status over 14 days.", len(stale), plural(len(stale)))},
+			Title:      "Stale open issues",
+			DetailHead: "IN STATUS",
+			Tickets:    m.refsFor(keys, func(k string) string { return fmtDays(ageByKey[k]) }),
+		})
+	}
+
+	if inProg := inProgressCount(m.openIssues); inProg > 5 {
+		var keys []string
+		for _, iss := range m.openIssues {
+			if iss.StatusCategory == "In Progress" {
+				keys = append(keys, iss.Key)
+			}
+		}
+		pts = append(pts, talkingPoint{
+			Lines:      []string{fmt.Sprintf("%d items in progress at once — watch for context switching.", inProg)},
+			Title:      "Currently in progress",
+			DetailHead: "",
+			Tickets:    m.refsFor(keys, nil),
+		})
+	}
+
+	// Points with no specific tickets behind them. They still render, they just
+	// aren't selectable.
+	if trend == "down" {
+		pts = append(pts, talkingPoint{Lines: []string{fmt.Sprintf(
+			"Velocity is below average lately (%.0f SP vs %.0f). Worth exploring blockers.", recentAvg, histAvg)}})
+	}
+	if carry.PooledRate > 0.3 {
+		pts = append(pts, talkingPoint{Lines: []string{fmt.Sprintf(
+			"Carrying over %.0f%% of committed points across %d sprint%s.", carry.PooledRate*100, carry.SprintsUsed, plural(carry.SprintsUsed))}})
+	}
+	if commitsLow {
+		pts = append(pts, talkingPoint{Lines: []string{"Lighter commit activity this week than the recent average."}})
+	}
+	if len(pts) == 0 {
+		pts = append(pts, talkingPoint{Lines: []string{"No workload, velocity or flow concerns this cycle."}})
+	}
+	return pts
+}
+
+func (m OneOnOneModel) renderTalkingPoints() string {
 	var sb strings.Builder
-	sb.WriteString(boldStyle.Render("Talking Points") + "\n")
-	for _, p := range points {
-		sb.WriteString("  • " + p + "\n")
+	head := boldStyle.Render("Talking Points")
+	switch {
+	case len(m.drillable) == 0:
+	case m.focus == ooFocusPoints:
+		head += dimStyle.Render("          j/k select · enter open · tab back to scroll")
+	default:
+		head += dimStyle.Render("          tab to select")
+	}
+	sb.WriteString(head + "\n")
+
+	selectedIdx := -1
+	if m.focus == ooFocusPoints && m.selected < len(m.drillable) {
+		selectedIdx = m.drillable[m.selected]
+	}
+	for i, p := range m.points {
+		marker, bullet := "  ", "• "
+		if len(p.Tickets) > 0 {
+			bullet = "• "
+		}
+		if i == selectedIdx {
+			marker = selectedStyle.Render("▸ ")
+		}
+		for j, line := range p.Lines {
+			lead := marker + bullet
+			if j > 0 {
+				lead = marker + "  "
+			}
+			if i == selectedIdx {
+				line = selectedStyle.Render(line)
+			}
+			sb.WriteString(lead + line + "\n")
+		}
+		// Always rendered, so moving the cursor doesn't reflow the list under it.
+		if len(p.Tickets) > 0 {
+			hint := fmt.Sprintf("      %d ticket%s", len(p.Tickets), plural(len(p.Tickets)))
+			if i == selectedIdx {
+				hint += " — enter to open"
+			}
+			sb.WriteString(dimStyle.Render(hint) + "\n")
+		}
 	}
 	sb.WriteString("\n")
+	return sb.String()
+}
+
+// renderDetail draws the drill-down table for the open talking point.
+func (m OneOnOneModel) renderDetail() string {
+	if m.detailIdx >= len(m.points) {
+		return ""
+	}
+	p := m.points[m.detailIdx]
+	baseURL := strings.TrimRight(m.cfg.Jira.BaseURL, "/")
+
+	var sb strings.Builder
+	sb.WriteString(boldStyle.Render(fmt.Sprintf("%s  (%d)", p.Title, len(p.Tickets))) + "\n\n")
+
+	detailW := 0
+	if p.DetailHead != "" {
+		detailW = len(p.DetailHead)
+		for _, r := range p.Tickets {
+			if len(r.Detail) > detailW {
+				detailW = len(r.Detail)
+			}
+		}
+	}
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("    %-12s  %-16s  %*s  %s",
+		"KEY", "STATUS", detailW, p.DetailHead, "SUMMARY")) + "\n")
+
+	for i, r := range p.Tickets {
+		marker := "  "
+		if i == m.detailRow {
+			marker = selectedStyle.Render("▸ ")
+		}
+		// The key is an OSC 8 hyperlink, so cmd-click works in iTerm2, Kitty,
+		// WezTerm and Ghostty; enter opens it for terminals that don't.
+		sb.WriteString(fmt.Sprintf("%s  %-12s  %-16s  %*s  %s\n",
+			marker,
+			jiraLink(r.Key, baseURL+"/browse/"+r.Key),
+			truncateName(r.Status, 16),
+			detailW, r.Detail,
+			truncateName(r.Summary, 44)))
+	}
 	return sb.String()
 }
 
@@ -1037,7 +1442,7 @@ func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
 
 	if f.IssuesAnalyzed == 0 {
 		sb.WriteString(boldStyle.Render("Cycle Time") + "\n")
-		sb.WriteString(dimStyle.Render("  No completed-issue history in the last 90 days.\n\n"))
+		sb.WriteString(dimStyle.Render("  No completed-issue history in the last 90 days.") + "\n\n")
 		return sb.String()
 	}
 
@@ -1051,6 +1456,8 @@ func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
 		p90 = "p90 " + fmtDays(f.P90CycleDays)
 	}
 	sb.WriteString(fmt.Sprintf("  %-16s p50 %-8s %s\n", "Start → done", fmtDays(f.P50CycleDays), p90))
+	sb.WriteString(dimStyle.Render(
+		"                   p50 = typical (half finish faster) · p90 = slow tail (9 in 10 finish faster)") + "\n")
 
 	if total := f.AvgPhase.Total(); total > 0 {
 		maxDays := 0.0
@@ -1059,34 +1466,32 @@ func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
 				maxDays = f.AvgPhase[p]
 			}
 		}
-		first := true
+		sb.WriteString("\n  " + boldStyle.Render("Where the time goes") +
+			dimStyle.Render("   (mean per issue)") + "\n")
 		for _, p := range domain.PhaseOrder {
 			d := f.AvgPhase[p]
 			if d <= 0 {
 				continue
 			}
-			label := "  Where it goes "
-			if !first {
-				label = "                "
-			}
-			first = false
 			tag := ""
 			if p.IsWait() {
-				tag = dimStyle.Render("  (wait)")
+				tag = dimStyle.Render("  waiting")
 			}
 			if p == domain.PhaseUnknown {
-				tag = warnStyle.Render("  (unclassified)")
+				tag = warnStyle.Render("  unclassified")
 			}
-			sb.WriteString(fmt.Sprintf("%s%-15s %-12s %6s  %3.0f%%%s\n",
-				label, p, spBar(d, maxDays, 10), fmtDays(d), f.PhaseShare[p]*100, tag))
+			sb.WriteString(fmt.Sprintf("    %-16s %-11s %6s  %3.0f%%%s\n",
+				p, spBar(d, maxDays, 10), fmtDays(d), f.PhaseShare[p]*100, tag))
 		}
 		if wait := f.AvgPhase.WaitTotal(); wait > 0 {
-			line := fmt.Sprintf("  %-16s %s of %s", "Total wait", fmtDays(wait), fmtDays(total))
+			sb.WriteString("    " + dimStyle.Render(strings.Repeat("─", 40)) + "\n")
+			line := fmt.Sprintf("    %-16s %-11s %6s  %3.0f%%", "Waiting, total", "", fmtDays(wait), wait/total*100)
 			if wait/total > 0.4 {
-				line += "  " + warnStyle.Render("⚠")
+				line += "  " + warnStyle.Render("⚠ queue-bound")
 			}
 			sb.WriteString(line + "\n")
 		}
+		sb.WriteString("\n")
 	}
 
 	if f.P50ReviewDays > 0 {
@@ -1104,8 +1509,8 @@ func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
 		"Throughput", f.ThroughputPerWeek, f.WindowWeeks))
 
 	if carry.SprintsUsed > 0 {
-		line := fmt.Sprintf("  %-16s %.0f%% of committed SP rolls over (%d sprints)",
-			"Carryover", carry.PooledRate*100, carry.SprintsUsed)
+		line := fmt.Sprintf("  %-16s %.0f%% of committed SP rolls over (%d sprint%s)",
+			"Carryover", carry.PooledRate*100, carry.SprintsUsed, plural(carry.SprintsUsed))
 		if carry.TicketsSized > 0 {
 			line += fmt.Sprintf(" · median ticket %.0f SP", carry.MedianTicketSP)
 		}
@@ -1121,7 +1526,8 @@ func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
 	}
 	if f.Truncated > 0 {
 		sb.WriteString(dimStyle.Render(fmt.Sprintf(
-			"  %d issue(s) had more history than Jira returns inline; their numbers may be short.\n", f.Truncated)))
+			"  %d issue%s had more history than Jira returns inline; their numbers may be short.",
+			f.Truncated, plural(f.Truncated))) + "\n")
 	}
 	sb.WriteString("\n")
 	return sb.String()
@@ -1133,7 +1539,7 @@ func (m OneOnOneModel) renderVelocity(stats []domain.MemberSprintStats,
 	var sb strings.Builder
 	sb.WriteString(boldStyle.Render("Sprint Velocity") + "  (last 6 sprints)\n")
 	if len(stats) == 0 {
-		sb.WriteString(dimStyle.Render("  No sprint data available.\n\n"))
+		sb.WriteString(dimStyle.Render("  No sprint data available.") + "\n\n")
 		return sb.String()
 	}
 	maxSP := 0.0
@@ -1153,14 +1559,20 @@ func (m OneOnOneModel) renderVelocity(stats []domain.MemberSprintStats,
 			s.CompletedSP, s.CompletedCount, stateTag))
 	}
 	sb.WriteString("\n")
-	trendLine := fmt.Sprintf("  Avg: %.0f SP/sprint   Recent avg: %.0f", histAvg, recentAvg)
-	switch trend {
-	case "down":
-		sb.WriteString(trendLine + "   " + warnStyle.Render("↓ lower than usual") + "\n")
-	case "up":
-		sb.WriteString(trendLine + "   " + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("↑ higher than usual") + "\n")
-	default:
-		sb.WriteString(trendLine + "   steady\n")
+	// spTrend needs at least two closed sprints to split into halves; below that
+	// it returns zeros, and printing "Avg: 0 SP/sprint" reads as a real result.
+	if histAvg > 0 || recentAvg > 0 {
+		trendLine := fmt.Sprintf("  Avg: %.0f SP/sprint   Recent avg: %.0f", histAvg, recentAvg)
+		switch trend {
+		case "down":
+			sb.WriteString(trendLine + "   " + warnStyle.Render("↓ lower than usual") + "\n")
+		case "up":
+			sb.WriteString(trendLine + "   " + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("↑ higher than usual") + "\n")
+		default:
+			sb.WriteString(trendLine + "   steady\n")
+		}
+	} else {
+		sb.WriteString(dimStyle.Render("  Not enough closed sprints yet for a trend.") + "\n")
 	}
 	sb.WriteString("\n")
 	return sb.String()
@@ -1176,7 +1588,7 @@ func (m OneOnOneModel) renderOpenIssues() string {
 
 	sb.WriteString(boldStyle.Render(fmt.Sprintf("Open Issues  (%d)", len(m.openIssues))) + "\n")
 	if len(m.openIssues) == 0 {
-		sb.WriteString(dimStyle.Render("  None — all clear.\n\n"))
+		sb.WriteString(dimStyle.Render("  None — all clear.") + "\n\n")
 		return sb.String()
 	}
 	for _, issue := range m.openIssues {
@@ -1213,10 +1625,10 @@ func (m OneOnOneModel) renderGitActivity(weeks []domain.WeekCount,
 
 	switch {
 	case len(m.team.Repos) == 0:
-		sb.WriteString(dimStyle.Render("  No repositories configured for this team.\n\n"))
+		sb.WriteString(dimStyle.Render("  No repositories configured for this team.") + "\n\n")
 		return sb.String()
 	case totalCommits == 0:
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("  No commits found.  (filter: --author=%s)\n\n", gitFilter)))
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("  No commits found.  (filter: --author=%s)\n", gitFilter)) + "\n")
 		return sb.String()
 	}
 
@@ -1245,7 +1657,7 @@ func (m OneOnOneModel) renderGitActivity(weeks []domain.WeekCount,
 
 func (m OneOnOneModel) renderMergeRequests() string {
 	return boldStyle.Render("Merge Requests") + "\n" +
-		dimStyle.Render("  Not available — GitLab access not configured.\n")
+		dimStyle.Render("  Not available — GitLab access not configured.") + "\n"
 }
 
 // topPhase returns the phase holding the largest share of cycle time.
