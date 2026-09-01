@@ -364,7 +364,9 @@ func isActiveStatus(s string) bool {
 func isDoneStatus(s string) bool {
 	sl := strings.ToLower(s)
 	return sl == "done" || sl == "closed" || sl == "resolved" ||
-		strings.Contains(sl, "complete")
+		strings.Contains(sl, "complete") || strings.Contains(sl, "deploy") ||
+		strings.Contains(sl, "release") || strings.Contains(sl, "merged") ||
+		strings.Contains(sl, "ship") || strings.Contains(sl, "ready to")
 }
 
 func isCodeReviewStatus(s string) bool {
@@ -600,9 +602,15 @@ func (m OneOnOneModel) renderContent() string {
 	sb.WriteString("\n")
 
 	// Git Activity section
+	gitFilter := m.member.Email
+	if gitFilter == "" {
+		gitFilter = m.member.DisplayName
+	}
 	sb.WriteString(bold.Render("Git Activity") + "  (last 8 weeks)\n")
-	if len(weeks) == 0 {
-		sb.WriteString(dimStyle.Render("  No commits found.\n"))
+	if len(m.team.Repos) == 0 {
+		sb.WriteString(dimStyle.Render("  No repositories configured for this team.\n"))
+	} else if len(weeks) == 0 {
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("  No commits found.  (filter: --author=%s)\n", gitFilter)))
 	} else {
 		maxCommits := 0
 		for _, w := range weeks {
