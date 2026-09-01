@@ -45,8 +45,14 @@ type OneOnOneModel struct {
 	pendingCommits      int
 	changelogsRequested bool
 	changelogsLoaded    bool
+	categoriesLoaded    bool
 
-	doraMetrics domain.MemberDORA
+	// catByID maps Jira status ID to status category name. Keyed by ID because
+	// status names are not unique across a site.
+	catByID             map[string]string
+	flow                domain.MemberFlow
+	openAges            []domain.OpenIssueAge
+	changelogWindowFrom time.Time
 
 	viewport viewport.Model
 	ready    bool
@@ -94,7 +100,7 @@ func (m OneOnOneModel) loading() bool {
 		return false
 	}
 	return !m.sprintsLoaded || !m.issuesLoaded || m.pendingCommits > 0 ||
-		m.pendingReports > 0 || !m.changelogsLoaded
+		m.pendingReports > 0 || !m.changelogsLoaded || !m.categoriesLoaded
 }
 
 func (m OneOnOneModel) Init() tea.Cmd {
@@ -112,6 +118,7 @@ func (m OneOnOneModel) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		m.jiraClient.FetchRecentSprints(m.team.BoardID, 6),
 		m.jiraClient.IssuesAssignedTo(m.member.AccountID),
+		m.jiraClient.FetchStatusCategories(),
 	}
 	for _, repo := range m.team.Repos {
 		cmds = append(cmds, git.FetchCommits(m.member.AccountID, repo, authorFilter, since))
@@ -150,9 +157,12 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sprints = msg.Sprints
 		m.sprintsLoaded = true
 		if len(msg.Sprints) == 0 {
+			// Don't short-circuit changelogs here: the member's open issues may
+			// still yield keys worth fetching histories for.
 			m.pendingReports = 0
-			m.changelogsLoaded = true
-			m.changelogsRequested = true
+			if cmd := m.maybeFetchChangelogs(); cmd != nil {
+				return m, cmd
+			}
 			m.finishIfDone()
 			return m, nil
 		}
@@ -177,23 +187,35 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingReports > 0 {
 			m.pendingReports--
 		}
-		// Fire changelog fetch once all sprint reports are in.
-		if m.pendingReports == 0 && !m.changelogsRequested {
-			m.changelogsRequested = true
-			keys := m.issueKeysForChangelog()
-			if len(keys) == 0 {
-				m.changelogsLoaded = true
-				m.finishIfDone()
-				return m, nil
-			}
-			return m, m.jiraClient.FetchChangelogs(m.member.AccountID, keys)
+		if cmd := m.maybeFetchChangelogs(); cmd != nil {
+			return m, cmd
 		}
+		m.finishIfDone()
+		return m, nil
+
+	case jira.StatusCategoriesResult:
+		if msg.Err == nil {
+			m.catByID = msg.ByID
+		}
+		m.categoriesLoaded = true
 		m.finishIfDone()
 		return m, nil
 
 	case jira.ChangelogsResult:
 		if msg.AccountID == m.member.AccountID {
-			m.doraMetrics = computeDORA(msg.Changelogs)
+			// Open issues are guaranteed present: maybeFetchChangelogs gates on
+			// issuesLoaded. So both derived values compute here off one clock.
+			now := time.Now()
+			byKey := make(map[string]domain.IssueChangelog, len(msg.Changelogs))
+			for _, cl := range msg.Changelogs {
+				byKey[cl.Key] = cl
+			}
+			openKeys := make(map[string]bool, len(m.openIssues))
+			for _, iss := range m.openIssues {
+				openKeys[iss.Key] = true
+			}
+			m.flow = m.computeFlow(msg.Changelogs, openKeys, m.changelogWindowFrom, now)
+			m.openAges = openIssueAges(m.openIssues, byKey, now)
 		}
 		m.changelogsLoaded = true
 		m.finishIfDone()
@@ -204,6 +226,9 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openIssues = msg.Issues
 		}
 		m.issuesLoaded = true
+		if cmd := m.maybeFetchChangelogs(); cmd != nil {
+			return m, cmd
+		}
 		m.finishIfDone()
 		return m, nil
 
@@ -280,115 +305,471 @@ func ooFetchOrLoadCached(boardID int, sprint domain.Sprint, client *jira.Client)
 
 // --- Metric helpers ---
 
-// issueKeysForChangelog collects issue keys completed by this member in the last 90 days.
-func (m *OneOnOneModel) issueKeysForChangelog() []string {
+// ooMaxChangelogIssues caps how many issue histories we fetch per person. Each
+// key is one HTTP GET at concurrency 10, so 80 is roughly 8 round trips.
+const ooMaxChangelogIssues = 80
+
+// maybeFetchChangelogs fires the single changelog batch once BOTH the sprint
+// reports and the member's open issues have landed, since the key list needs
+// both. Safe to call from any branch: it no-ops until every precondition holds
+// and never fires twice. When there is nothing to fetch it marks changelogs
+// loaded itself, so the loading() gate always clears.
+func (m *OneOnOneModel) maybeFetchChangelogs() tea.Cmd {
+	if m.changelogsRequested || m.state == ooStateError {
+		return nil
+	}
+	if !m.sprintsLoaded || m.pendingReports > 0 || !m.issuesLoaded {
+		return nil
+	}
+	m.changelogsRequested = true
+	keys, from := m.issueKeysForChangelog()
+	if from.IsZero() {
+		from = time.Now().AddDate(0, 0, -90)
+	}
+	m.changelogWindowFrom = from
+	if len(keys) == 0 {
+		m.changelogsLoaded = true
+		return nil
+	}
+	return m.jiraClient.FetchChangelogs(m.member.AccountID, keys)
+}
+
+// issueKeysForChangelog collects the keys we need histories for: this member's
+// currently-open issues, plus everything they completed in the last 90 days. It
+// also returns the start of the window actually sampled, which the throughput
+// denominator uses — a hardcoded 90 days would overstate the window whenever the
+// cap truncates the sample.
+func (m *OneOnOneModel) issueKeysForChangelog() ([]string, time.Time) {
 	cutoff := time.Now().AddDate(0, -3, 0)
 	seen := map[string]bool{}
 	var keys []string
-	for _, r := range m.sprintReports {
+	var from time.Time
+
+	// Open issues first so the cap can never evict them; they're the ones we need
+	// for time-in-status.
+	for _, iss := range m.openIssues {
+		if !seen[iss.Key] {
+			seen[iss.Key] = true
+			keys = append(keys, iss.Key)
+		}
+	}
+
+	// sprintReports is appended in async completion order, so iterating it as-is
+	// makes the cap drop a random set of sprints run to run. Sort newest-first so
+	// truncation deterministically drops the oldest.
+	reports := append([]domain.SprintReportData(nil), m.sprintReports...)
+	sort.Slice(reports, func(i, j int) bool {
+		return reports[i].Sprint.EndDate > reports[j].Sprint.EndDate
+	})
+
+	for _, r := range reports {
 		endDate, err := time.Parse("2006-01-02", r.Sprint.EndDate)
 		if err != nil || endDate.Before(cutoff) {
 			continue
+		}
+		if start, err := time.Parse("2006-01-02", r.Sprint.StartDate); err == nil {
+			if from.IsZero() || start.Before(from) {
+				from = start
+			}
 		}
 		for _, issue := range r.Completed {
 			if issue.Assignee == m.member.DisplayName && !seen[issue.Key] {
 				seen[issue.Key] = true
 				keys = append(keys, issue.Key)
-				if len(keys) >= 50 {
-					return keys
+				if len(keys) >= ooMaxChangelogIssues {
+					return keys, from
 				}
 			}
 		}
 	}
-	return keys
+	return keys, from
 }
 
-// computeDORA derives cycle time, code review wait, and rework count from issue changelogs.
-func computeDORA(changelogs []domain.IssueChangelog) domain.MemberDORA {
-	dora := domain.MemberDORA{IssuesAnalyzed: len(changelogs)}
-	var cycleTimes, reviewTimes []float64
+// category returns the Jira status category for a transition endpoint. The ID is
+// authoritative; the name is only a fallback for the rare transition where Jira
+// omits the ID (some creation paths) or the status map failed to load.
+func (m OneOnOneModel) category(id, name string) string {
+	if c, ok := m.catByID[id]; ok {
+		return c
+	}
+	return guessCategory(name)
+}
+
+// guessCategory is the keyword fallback for when the status map is unavailable.
+// Deliberately conservative: it is better to return To Do and have the phase
+// land in Unclassified than to guess Done and truncate a cycle time.
+func guessCategory(name string) string {
+	sl := strings.ToLower(strings.TrimSpace(name))
+	switch sl {
+	case "done", "closed", "resolved", "deployed", "released", "complete", "completed":
+		return domain.CatDone
+	case "to do", "todo", "open", "new", "backlog":
+		return domain.CatTodo
+	}
+	if strings.Contains(sl, "deploy") || strings.Contains(sl, "closed") {
+		return domain.CatDone
+	}
+	if strings.Contains(sl, "backlog") || strings.Contains(sl, "triage") {
+		return domain.CatTodo
+	}
+	return domain.CatInProgress
+}
+
+// phaseOf buckets a status into a workflow phase. The category decides the Todo
+// and Done boundaries (exact, from Jira); the name table decides the finer split
+// within In Progress. A status in neither returns PhaseUnknown and is reported,
+// never silently folded into a neighbouring bucket.
+func (m OneOnOneModel) phaseOf(id, name string) domain.Phase {
+	switch m.category(id, name) {
+	case domain.CatDone:
+		return domain.PhaseDone
+	case domain.CatTodo:
+		return domain.PhaseTodo
+	}
+	switch m.team.EffectivePhases()[strings.TrimSpace(name)] {
+	case "dev":
+		return domain.PhaseDev
+	case "review":
+		return domain.PhaseReview
+	case "awaiting_merge":
+		return domain.PhaseAwaitingMerge
+	case "qa":
+		return domain.PhaseQA
+	case "awaiting_qa":
+		return domain.PhaseAwaitingQA
+	case "rework":
+		return domain.PhaseRework
+	case "blocked":
+		return domain.PhaseBlocked
+	}
+	return phaseByKeyword(name)
+}
+
+// phaseByKeyword is the fallback for In Progress statuses absent from the phase
+// table. "Ready for X" and "Awaiting X" resolve to the queue phase rather than to
+// X itself, which is the distinction the whole breakdown rests on.
+func phaseByKeyword(name string) domain.Phase {
+	sl := strings.ToLower(name)
+	queued := strings.Contains(sl, "ready for") || strings.Contains(sl, "ready to") ||
+		strings.Contains(sl, "awaiting") || strings.Contains(sl, "waiting")
+	switch {
+	case strings.Contains(sl, "block") || strings.Contains(sl, "on hold") || strings.Contains(sl, "parked"):
+		return domain.PhaseBlocked
+	case strings.Contains(sl, "fix needed") || strings.Contains(sl, "rework") || strings.Contains(sl, "reopen"):
+		return domain.PhaseRework
+	case strings.Contains(sl, "qa") || strings.Contains(sl, "test") || strings.Contains(sl, "uat"):
+		if queued {
+			return domain.PhaseAwaitingQA
+		}
+		return domain.PhaseQA
+	case strings.Contains(sl, "review") || strings.Contains(sl, "merge"):
+		if queued {
+			return domain.PhaseAwaitingMerge
+		}
+		return domain.PhaseReview
+	case strings.Contains(sl, "progress") || strings.Contains(sl, "development") || strings.Contains(sl, "started"):
+		return domain.PhaseDev
+	}
+	return domain.PhaseUnknown
+}
+
+// issueCycle walks one issue's transitions, attributing each interval to the
+// phase the issue sat in during that interval. Returns the cycle plus any status
+// names no classifier recognised.
+func (m OneOnOneModel) issueCycle(cl domain.IssueChangelog, open bool, now time.Time) (domain.IssueCycle, []string) {
+	c := domain.IssueCycle{Key: cl.Key, Phases: domain.PhaseDurations{}}
+	tr := cl.Transitions
+	var unknown []string
+	note := func(name string, p domain.Phase) {
+		if p == domain.PhaseUnknown && strings.TrimSpace(name) != "" {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(tr) == 0 {
+		return c, unknown
+	}
+
+	// Leading segment: created → first transition. Without this the backlog wait
+	// we are specifically trying to expose goes unattributed. An empty From on the
+	// first change means the initial status, which is overwhelmingly To Do.
+	if !cl.Created.IsZero() {
+		p := domain.PhaseTodo
+		if strings.TrimSpace(tr[0].From) != "" {
+			p = m.phaseOf(tr[0].FromID, tr[0].From)
+			note(tr[0].From, p)
+		}
+		c.Phases.Add(p, tr[0].Timestamp.Sub(cl.Created).Hours()/24)
+	}
+
+	for i := range tr {
+		p := m.phaseOf(tr[i].ToID, tr[i].To)
+		note(tr[i].To, p)
+
+		if c.Start.IsZero() && p.IsWorking() {
+			c.Start = tr[i].Timestamp
+		}
+		switch {
+		case p == domain.PhaseDone && c.Done.IsZero():
+			// First entry into the Done category ends the clock, so a ticket that
+			// reaches "Ready to Deploy" and then sits there for six weeks before
+			// someone flips it to Closed is not charged for the wait. This matches
+			// `statusCategory IN (Done)`.
+			c.Done = tr[i].Timestamp
+			c.Completed = true
+		case p != domain.PhaseDone && !c.Done.IsZero():
+			// Left the Done category again: the earlier completion didn't stick,
+			// so restart and let the next one count.
+			c.Done = time.Time{}
+			c.Completed = false
+		}
+		if m.isReopen(tr[i]) {
+			c.Reopened++
+		}
+		if m.isQABounce(tr[i]) {
+			c.QABounces++
+		}
+
+		var until time.Time
+		switch {
+		case i+1 < len(tr):
+			until = tr[i+1].Timestamp
+		case open && p != domain.PhaseDone:
+			until = now
+		default:
+			continue // terminal, or a closed issue with nothing after
+		}
+		c.Phases.Add(p, until.Sub(tr[i].Timestamp).Hours()/24)
+	}
+
+	if c.Completed && !c.Start.IsZero() && c.Done.After(c.Start) {
+		c.CycleDays = c.Done.Sub(c.Start).Hours() / 24
+	}
+	return c, unknown
+}
+
+// isReopen reports a regression out of a Done-category status back into work:
+// the ticket was declared finished and then wasn't.
+func (m OneOnOneModel) isReopen(t domain.StatusTransition) bool {
+	return m.category(t.FromID, t.From) == domain.CatDone &&
+		m.category(t.ToID, t.To) != domain.CatDone
+}
+
+// isQABounce reports a kick-back from QA or review to development or to an
+// explicit rework status such as "Bug Fix Needed".
+func (m OneOnOneModel) isQABounce(t domain.StatusTransition) bool {
+	from := m.phaseOf(t.FromID, t.From)
+	to := m.phaseOf(t.ToID, t.To)
+	fromLate := from == domain.PhaseQA || from == domain.PhaseAwaitingQA || from == domain.PhaseReview
+	toBack := to == domain.PhaseDev || to == domain.PhaseRework
+	return fromLate && toBack
+}
+
+// phasePasses returns one duration sample per entry into the given phase. Two
+// adjacent statuses in the same phase produce two samples, which is intended:
+// the old enter/exit pair silently lost the first interval when that happened.
+func (m OneOnOneModel) phasePasses(cl domain.IssueChangelog, want domain.Phase) []float64 {
+	var out []float64
+	tr := cl.Transitions
+	for i := 0; i+1 < len(tr); i++ {
+		if m.phaseOf(tr[i].ToID, tr[i].To) != want {
+			continue
+		}
+		if d := tr[i+1].Timestamp.Sub(tr[i].Timestamp).Hours() / 24; d > 0 {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// computeFlow folds the changelog batch into flow metrics. openKeys marks issues
+// still in flight: they contribute to rework counts (a ticket sitting in "Bug Fix
+// Needed" right now definitely bounced) but are excluded from cycle-time
+// percentiles and throughput, where an unfinished issue has no end.
+func (m OneOnOneModel) computeFlow(changelogs []domain.IssueChangelog, openKeys map[string]bool,
+	from, to time.Time) domain.MemberFlow {
+
+	f := domain.MemberFlow{AvgPhase: domain.PhaseDurations{}, PhaseShare: domain.PhaseDurations{}}
+	phaseSum := domain.PhaseDurations{}
+	unknownSeen := map[string]bool{}
+	var cycles []domain.IssueCycle
+
 	for _, cl := range changelogs {
-		var firstActive, lastDone *time.Time
-		var enterReview *time.Time
-		reworked := false
-		for i := range cl.Transitions {
-			t := &cl.Transitions[i]
-			if isActiveStatus(t.To) && firstActive == nil {
-				ts := t.Timestamp
-				firstActive = &ts
-			}
-			if isDoneStatus(t.To) {
-				ts := t.Timestamp
-				lastDone = &ts
-			}
-			// Code review timing
-			if isCodeReviewStatus(t.To) {
-				ts := t.Timestamp
-				enterReview = &ts
-			} else if enterReview != nil && isCodeReviewStatus(t.From) {
-				d := t.Timestamp.Sub(*enterReview).Hours() / 24
-				if d > 0 {
-					reviewTimes = append(reviewTimes, d)
-				}
-				enterReview = nil
-			}
-			// Rework detection
-			if !reworked && isReworkTransition(t.From, t.To) {
-				reworked = true
-				dora.ReworkCount++
-			}
+		open := openKeys[cl.Key]
+		c, unknown := m.issueCycle(cl, open, to)
+		for _, s := range unknown {
+			unknownSeen[s] = true
 		}
-		if firstActive != nil && lastDone != nil && lastDone.After(*firstActive) {
-			cycleTimes = append(cycleTimes, lastDone.Sub(*firstActive).Hours()/24)
+		if cl.Truncated {
+			f.Truncated++
+		}
+
+		if c.Reopened > 0 {
+			f.ReopenedIssues++
+			f.ReopenedEvents += c.Reopened
+		}
+		if c.QABounces > 0 {
+			f.QABounceIssues++
+			f.QABounceEvents += c.QABounces
+		}
+		f.ReviewDays = append(f.ReviewDays, m.phasePasses(cl, domain.PhaseReview)...)
+
+		if open {
+			continue
+		}
+		f.IssuesAnalyzed++
+		if c.CycleDays <= 0 {
+			continue
+		}
+		f.IssuesCompleted++
+		cycles = append(cycles, c)
+		f.CycleDays = append(f.CycleDays, c.CycleDays)
+		phaseSum.Merge(c.Phases)
+		if c.CycleDays > f.MaxCycleDays {
+			f.MaxCycleDays, f.MaxCycleKey = c.CycleDays, c.Key
 		}
 	}
-	if len(cycleTimes) > 0 {
-		var sum float64
-		for _, d := range cycleTimes {
-			sum += d
-		}
-		dora.AvgCycleTimeDays = sum / float64(len(cycleTimes))
+
+	sort.Float64s(f.CycleDays)
+	f.P50CycleDays = percentile(f.CycleDays, 50)
+	f.P90CycleDays = percentile(f.CycleDays, 90)
+	f.P50ReviewDays = percentile(f.ReviewDays, 50)
+
+	if f.IssuesCompleted > 0 {
+		f.AvgPhase = phaseSum.Scale(1 / float64(f.IssuesCompleted))
 	}
-	if len(reviewTimes) > 0 {
-		var sum float64
-		for _, d := range reviewTimes {
-			sum += d
-		}
-		dora.AvgCodeReviewDays = sum / float64(len(reviewTimes))
+	if total := phaseSum.Total(); total > 0 {
+		f.PhaseShare = phaseSum.Scale(1 / total)
 	}
-	return dora
+	f.DoneByWeek, f.WindowWeeks = doneByWeek(cycles, from, to)
+	if f.WindowWeeks > 0 {
+		f.ThroughputPerWeek = float64(len(cycles)) / f.WindowWeeks
+	}
+	for s := range unknownSeen {
+		f.UnknownStatuses = append(f.UnknownStatuses, s)
+	}
+	sort.Strings(f.UnknownStatuses)
+	return f
 }
 
-func isActiveStatus(s string) bool {
-	sl := strings.ToLower(s)
-	return strings.Contains(sl, "progress") || strings.Contains(sl, "development") ||
-		strings.Contains(sl, "started") || sl == "open"
+// percentile returns the p-th percentile (0..100) by nearest rank. vals must
+// already be sorted ascending.
+func percentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	s := vals
+	if !sort.Float64sAreSorted(s) {
+		s = append([]float64(nil), vals...)
+		sort.Float64s(s)
+	}
+	idx := int(math.Ceil(p/100*float64(len(s)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(s) {
+		idx = len(s) - 1
+	}
+	return s[idx]
 }
 
-func isDoneStatus(s string) bool {
-	sl := strings.ToLower(s)
-	return sl == "done" || sl == "closed" || sl == "resolved" ||
-		strings.Contains(sl, "complete") || strings.Contains(sl, "deploy") ||
-		strings.Contains(sl, "release") || strings.Contains(sl, "merged") ||
-		strings.Contains(sl, "ship") || strings.Contains(sl, "ready to")
+// doneByWeek buckets completed cycles into ISO weeks, most recent first, and
+// returns the window length in weeks. The window is passed in rather than
+// inferred from the data: inferring it understates the span whenever the member
+// finished nothing in the first or last week, which inflates throughput.
+func doneByWeek(cycles []domain.IssueCycle, from, to time.Time) ([]domain.WeekCount, float64) {
+	weeks := to.Sub(from).Hours() / 24 / 7
+	if weeks < 1 {
+		weeks = 1
+	}
+	counts := map[string]int{}
+	for _, c := range cycles {
+		if c.Done.IsZero() {
+			continue
+		}
+		y, w := c.Done.ISOWeek()
+		counts[fmt.Sprintf("%d-W%02d", y, w)]++
+	}
+	out := make([]domain.WeekCount, 0, len(counts))
+	for k, v := range counts {
+		out = append(out, domain.WeekCount{Label: k, Count: v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Label > out[j].Label })
+	return out, weeks
 }
 
-func isCodeReviewStatus(s string) bool {
-	sl := strings.ToLower(s)
-	return strings.Contains(sl, "code review") || strings.Contains(sl, "in review") ||
-		strings.Contains(sl, "peer review")
+// openIssueAges derives how long each open issue has sat in its present status.
+// Falls back to the issue's Updated date, flagged inexact, when the changelog is
+// missing or disagrees with the live status.
+func openIssueAges(issues []domain.JiraIssue, byKey map[string]domain.IssueChangelog,
+	now time.Time) []domain.OpenIssueAge {
+
+	out := make([]domain.OpenIssueAge, 0, len(issues))
+	for _, iss := range issues {
+		age := domain.OpenIssueAge{Key: iss.Key}
+		cl, ok := byKey[iss.Key]
+		switch {
+		case ok && len(cl.Transitions) > 0 &&
+			strings.EqualFold(cl.Transitions[len(cl.Transitions)-1].To, iss.Status):
+			age.DaysInStatus = now.Sub(cl.Transitions[len(cl.Transitions)-1].Timestamp).Hours() / 24
+			age.Exact = true
+		case ok && len(cl.Transitions) == 0 && !cl.Created.IsZero():
+			// Never moved since creation.
+			age.DaysInStatus = now.Sub(cl.Created).Hours() / 24
+			age.Exact = true
+		default:
+			if t, err := domain.ParseJiraTime(iss.Updated); err == nil {
+				age.DaysInStatus = now.Sub(t).Hours() / 24
+			}
+		}
+		out = append(out, age)
+	}
+	return out
 }
 
-func isReworkTransition(from, to string) bool {
-	fromLow, toLow := strings.ToLower(from), strings.ToLower(to)
-	laterStatus := strings.Contains(fromLow, "review") || strings.Contains(fromLow, "test") ||
-		strings.Contains(fromLow, "qa") || strings.Contains(fromLow, "done") ||
-		strings.Contains(fromLow, "closed") || strings.Contains(fromLow, "resolv") ||
-		strings.Contains(fromLow, "accept")
-	reworkTarget := toLow == "in progress" || strings.Contains(toLow, "fix") ||
-		strings.Contains(toLow, "rework") || strings.Contains(toLow, "revise") ||
-		strings.Contains(toLow, "reopen")
-	return laterStatus && reworkTarget
+// carryoverStats derives what fraction of a member's committed points roll to the
+// next sprint, plus their median completed ticket size.
+func carryoverStats(displayName string, stats []domain.MemberSprintStats,
+	reports []domain.SprintReportData) domain.CarryoverStats {
+
+	var cs domain.CarryoverStats
+	var sumInc, sumTotal float64
+	for _, s := range stats {
+		if strings.ToLower(s.Sprint.State) == "active" {
+			continue // carryover isn't decided until the sprint closes
+		}
+		total := s.CompletedSP + s.IncompleteSP
+		if total <= 0 {
+			// Unestimated sprints sum to 0/0. Counting them as 0% carryover would
+			// dilute the rate toward optimism, so skip them.
+			continue
+		}
+		cs.SprintsUsed++
+		sumInc += s.IncompleteSP
+		sumTotal += total
+	}
+	if sumTotal > 0 {
+		// Pooled rather than a mean of per-sprint ratios, which would weight a
+		// 2-point sprint the same as a 20-point one.
+		cs.PooledRate = sumInc / sumTotal
+	}
+
+	seen := map[string]bool{}
+	var sizes []float64
+	for _, r := range reports {
+		for _, iss := range r.Completed {
+			// FinalSP is nil for unestimated tickets; including them as 0 would
+			// drag the median to 0 on an unestimated-heavy sprint.
+			if iss.Assignee != displayName || iss.FinalSP == nil || seen[iss.Key] {
+				continue
+			}
+			seen[iss.Key] = true
+			sizes = append(sizes, *iss.FinalSP)
+		}
+	}
+	sort.Float64s(sizes)
+	cs.TicketsSized = len(sizes)
+	cs.MedianTicketSP = percentile(sizes, 50)
+	return cs
 }
 
 func memberStatsFromReports(displayName string, reports []domain.SprintReportData) []domain.MemberSprintStats {
@@ -462,39 +843,76 @@ func spTrend(stats []domain.MemberSprintStats) (recentAvg, historicalAvg float64
 	return recentAvg, historicalAvg, "stable"
 }
 
-// commitsByWeek groups commits into ISO-week buckets, returns weeks sorted desc.
-func commitsByWeek(commits []domain.GitCommit) []struct {
-	Label string
-	Count int
-} {
-	counts := map[string]int{}
+// isoWeekStart returns midnight UTC on the Monday of t's ISO week. Note that
+// time.Truncate(24*time.Hour) is NOT a substitute: it truncates against the UTC
+// epoch and shifts local dates by a day.
+func isoWeekStart(t time.Time) time.Time {
+	y, mo, d := t.Date()
+	day := time.Date(y, mo, d, 0, 0, 0, 0, time.UTC)
+	wd := int(day.Weekday())
+	if wd == 0 {
+		wd = 7 // Sunday
+	}
+	return day.AddDate(0, 0, 1-wd)
+}
+
+// commitsByWeek buckets commits into a fixed-length window of ISO weeks, most
+// recent first. Weeks with no commits are present in the result, which is the
+// whole point: averaging over only the weeks that had commits reports "average
+// per active week" and overstates the real cadence.
+func commitsByWeek(commits []domain.GitCommit, now time.Time, weeks int) []domain.WeekCount {
+	if weeks < 1 {
+		weeks = 1
+	}
+	current := isoWeekStart(now)
+	buckets := make([]domain.WeekCount, weeks)
+	index := make(map[time.Time]int, weeks)
+	for i := range buckets {
+		start := current.AddDate(0, 0, -7*i)
+		y, w := start.ISOWeek()
+		buckets[i] = domain.WeekCount{Label: fmt.Sprintf("%d-W%02d", y, w)}
+		index[start] = i
+	}
 	for _, c := range commits {
 		t, err := time.Parse("2006-01-02", c.Date)
 		if err != nil {
 			continue
 		}
-		y, w := t.ISOWeek()
-		key := fmt.Sprintf("%d-W%02d", y, w)
-		counts[key]++
+		if i, ok := index[isoWeekStart(t)]; ok {
+			buckets[i].Count++
+		}
 	}
-	type week struct {
-		Label string
-		Count int
+	return buckets
+}
+
+// commitCadence summarises the week buckets. avg is a float over the full window,
+// not integer-divided over active weeks as the previous version was.
+func commitCadence(weeks []domain.WeekCount) (avg float64, thisWeek, active, total int) {
+	for _, w := range weeks {
+		total += w.Count
+		if w.Count > 0 {
+			active++
+		}
 	}
-	weeks := make([]week, 0, len(counts))
-	for k, v := range counts {
-		weeks = append(weeks, week{k, v})
+	if len(weeks) > 0 {
+		avg = float64(total) / float64(len(weeks))
+		thisWeek = weeks[0].Count
 	}
-	sort.Slice(weeks, func(i, j int) bool { return weeks[i].Label > weeks[j].Label })
-	result := make([]struct {
-		Label string
-		Count int
-	}, len(weeks))
-	for i, w := range weeks {
-		result[i].Label = w.Label
-		result[i].Count = w.Count
+	return avg, thisWeek, active, total
+}
+
+// belowAverageCommits reports whether this week's commit count is meaningfully
+// low. The current week is partial, so the average is pro-rated by days elapsed;
+// comparing a Tuesday against a full-week average would fire almost every week.
+func belowAverageCommits(weeks []domain.WeekCount, avg float64, thisWeek, active int, now time.Time) bool {
+	if len(weeks) < 4 || active < 3 || avg < 2 {
+		return false // too little history, or too low a volume, to judge
 	}
-	return result
+	elapsed := now.Sub(isoWeekStart(now)).Hours()/24 + 1
+	if elapsed > 7 {
+		elapsed = 7
+	}
+	return float64(thisWeek) < (avg*elapsed/7)/2
 }
 
 func spBar(val, max float64, width int) string {
@@ -518,199 +936,339 @@ func inProgressCount(issues []domain.JiraIssue) int {
 	return n
 }
 
-func workloadSignal(openCount, inProgress int, recentAvgSP float64) string {
-	if inProgress > 5 {
-		return "very-high"
+// fmtDays renders a day count compactly: "6h", "1.4d", "12d".
+func fmtDays(d float64) string {
+	switch {
+	case d <= 0:
+		return "0"
+	case d < 1:
+		return fmt.Sprintf("%.0fh", d*24)
+	case d < 10:
+		return fmt.Sprintf("%.1fd", d)
+	default:
+		return fmt.Sprintf("%.0fd", d)
 	}
-	if inProgress > 3 {
-		return "high"
-	}
-	_ = recentAvgSP // future: compare open SP vs velocity
-	return ""
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // --- Renderer ---
 
 func (m OneOnOneModel) renderContent() string {
 	var sb strings.Builder
-	bold := lipgloss.NewStyle().Bold(true)
+	now := time.Now()
 
+	// Compute everything up front. Talking Points renders first but depends on
+	// every section below it, so nothing may compute inline during rendering.
 	stats := memberStatsFromReports(m.member.DisplayName, m.sprintReports)
 	recentAvg, histAvg, trend := spTrend(stats)
-	weeks := commitsByWeek(m.commits)
+	weeks := commitsByWeek(m.commits, now, 8)
+	avgCommits, thisWeek, activeWeeks, totalCommits := commitCadence(weeks)
+	commitsLow := belowAverageCommits(weeks, avgCommits, thisWeek, activeWeeks, now)
 	inProg := inProgressCount(m.openIssues)
-	wlSignal := workloadSignal(len(m.openIssues), inProg, recentAvg)
+	carry := carryoverStats(m.member.DisplayName, stats, m.sprintReports)
 
-	// Sprint Velocity section
-	sb.WriteString(bold.Render("Sprint Velocity") + "  (last 6 sprints)\n")
+	sb.WriteString(m.renderTalkingPoints(trend, recentAvg, histAvg, carry, commitsLow, inProg))
+	sb.WriteString(m.renderCycleTime(carry))
+	sb.WriteString(m.renderVelocity(stats, recentAvg, histAvg, trend))
+	sb.WriteString(m.renderOpenIssues())
+	sb.WriteString(m.renderGitActivity(weeks, avgCommits, thisWeek, activeWeeks, totalCommits, commitsLow))
+	sb.WriteString(m.renderMergeRequests())
+	return sb.String()
+}
+
+func (m OneOnOneModel) renderTalkingPoints(trend string, recentAvg, histAvg float64,
+	carry domain.CarryoverStats, commitsLow bool, inProg int) string {
+
+	f := m.flow
+	var points []string
+
+	// Lead with the phase breakdown when one non-dev phase dominates: that is the
+	// difference between a coding problem and a queue problem.
+	if top, share := topPhase(f.PhaseShare); share > 0.4 && top != domain.PhaseDev && top != domain.PhaseTodo {
+		points = append(points, fmt.Sprintf(
+			"%.0f%% of cycle time is spent in %s (%s avg). %s",
+			share*100, top, fmtDays(f.AvgPhase[top]),
+			map[bool]string{true: "Queue problem, not a coding problem.", false: "Worth asking what's slow there."}[top.IsWait()]))
+	}
+	if f.IssuesCompleted >= 8 && f.MaxCycleDays > 3*f.P50CycleDays && f.MaxCycleKey != "" {
+		points = append(points, fmt.Sprintf(
+			"%s took %s against a median of %s — worth asking what stalled.",
+			f.MaxCycleKey, fmtDays(f.MaxCycleDays), fmtDays(f.P50CycleDays)))
+	}
+	if f.QABounceIssues > 0 {
+		points = append(points, fmt.Sprintf("%d issue(s) kicked back from QA or review (%d times).",
+			f.QABounceIssues, f.QABounceEvents))
+	}
+	if f.ReopenedIssues > 0 {
+		points = append(points, fmt.Sprintf("%d issue(s) reopened after being marked done.", f.ReopenedIssues))
+	}
+	if trend == "down" {
+		points = append(points, fmt.Sprintf(
+			"Velocity is below average lately (%.0f SP vs %.0f). Worth exploring blockers.", recentAvg, histAvg))
+	}
+	if carry.PooledRate > 0.3 {
+		points = append(points, fmt.Sprintf("Carrying over %.0f%% of committed points across %d sprints.",
+			carry.PooledRate*100, carry.SprintsUsed))
+	}
+	if stale := staleOpenIssues(m.openAges, 14); len(stale) > 0 {
+		points = append(points, fmt.Sprintf("%d open issue(s) have sat in the same status over 14 days.", len(stale)))
+	}
+	if inProg > 5 {
+		points = append(points, fmt.Sprintf("%d items in progress at once — watch for context switching.", inProg))
+	}
+	if commitsLow {
+		points = append(points, "Lighter commit activity this week than the recent average.")
+	}
+	if len(points) == 0 {
+		points = append(points, "No workload, velocity or flow concerns this cycle.")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(boldStyle.Render("Talking Points") + "\n")
+	for _, p := range points {
+		sb.WriteString("  • " + p + "\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+func (m OneOnOneModel) renderCycleTime(carry domain.CarryoverStats) string {
+	f := m.flow
+	var sb strings.Builder
+
+	if f.IssuesAnalyzed == 0 {
+		sb.WriteString(boldStyle.Render("Cycle Time") + "\n")
+		sb.WriteString(dimStyle.Render("  No completed-issue history in the last 90 days.\n\n"))
+		return sb.String()
+	}
+
+	sb.WriteString(boldStyle.Render(fmt.Sprintf("Cycle Time  (90 days · %d issues, %d with a usable cycle)",
+		f.IssuesAnalyzed, f.IssuesCompleted)) + "\n")
+
+	// p90 over a handful of samples IS just the second-largest value. Showing it
+	// would trade one misleading number for another.
+	p90 := dimStyle.Render("p90 n/a (too few)")
+	if len(f.CycleDays) >= 8 {
+		p90 = "p90 " + fmtDays(f.P90CycleDays)
+	}
+	sb.WriteString(fmt.Sprintf("  %-16s p50 %-8s %s\n", "Start → done", fmtDays(f.P50CycleDays), p90))
+
+	if total := f.AvgPhase.Total(); total > 0 {
+		maxDays := 0.0
+		for _, p := range domain.PhaseOrder {
+			if f.AvgPhase[p] > maxDays {
+				maxDays = f.AvgPhase[p]
+			}
+		}
+		first := true
+		for _, p := range domain.PhaseOrder {
+			d := f.AvgPhase[p]
+			if d <= 0 {
+				continue
+			}
+			label := "  Where it goes "
+			if !first {
+				label = "                "
+			}
+			first = false
+			tag := ""
+			if p.IsWait() {
+				tag = dimStyle.Render("  (wait)")
+			}
+			if p == domain.PhaseUnknown {
+				tag = warnStyle.Render("  (unclassified)")
+			}
+			sb.WriteString(fmt.Sprintf("%s%-15s %-12s %6s  %3.0f%%%s\n",
+				label, p, spBar(d, maxDays, 10), fmtDays(d), f.PhaseShare[p]*100, tag))
+		}
+		if wait := f.AvgPhase.WaitTotal(); wait > 0 {
+			line := fmt.Sprintf("  %-16s %s of %s", "Total wait", fmtDays(wait), fmtDays(total))
+			if wait/total > 0.4 {
+				line += "  " + warnStyle.Render("⚠")
+			}
+			sb.WriteString(line + "\n")
+		}
+	}
+
+	if f.P50ReviewDays > 0 {
+		sb.WriteString(fmt.Sprintf("  %-16s p50 %s\n", "Review wait", fmtDays(f.P50ReviewDays)))
+	}
+
+	rework := fmt.Sprintf("  %-16s %d kicked back from QA (%d times) · %d reopened after done",
+		"Rework", f.QABounceIssues, f.QABounceEvents, f.ReopenedIssues)
+	if f.QABounceIssues > 0 || f.ReopenedIssues > 0 {
+		rework += "  " + warnStyle.Render("⚠")
+	}
+	sb.WriteString(rework + "\n")
+
+	sb.WriteString(fmt.Sprintf("  %-16s %.1f issues/week over %.0f weeks\n",
+		"Throughput", f.ThroughputPerWeek, f.WindowWeeks))
+
+	if carry.SprintsUsed > 0 {
+		line := fmt.Sprintf("  %-16s %.0f%% of committed SP rolls over (%d sprints)",
+			"Carryover", carry.PooledRate*100, carry.SprintsUsed)
+		if carry.TicketsSized > 0 {
+			line += fmt.Sprintf(" · median ticket %.0f SP", carry.MedianTicketSP)
+		}
+		if carry.PooledRate > 0.3 {
+			line += "  " + warnStyle.Render("⚠")
+		}
+		sb.WriteString(line + "\n")
+	}
+
+	if len(f.UnknownStatuses) > 0 {
+		sb.WriteString(warnStyle.Render(fmt.Sprintf("  ⚠ Unrecognised statuses: %s",
+			strings.Join(f.UnknownStatuses, ", "))) + "\n")
+	}
+	if f.Truncated > 0 {
+		sb.WriteString(dimStyle.Render(fmt.Sprintf(
+			"  %d issue(s) had more history than Jira returns inline; their numbers may be short.\n", f.Truncated)))
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+func (m OneOnOneModel) renderVelocity(stats []domain.MemberSprintStats,
+	recentAvg, histAvg float64, trend string) string {
+
+	var sb strings.Builder
+	sb.WriteString(boldStyle.Render("Sprint Velocity") + "  (last 6 sprints)\n")
 	if len(stats) == 0 {
-		sb.WriteString(dimStyle.Render("  No sprint data available.\n"))
-	} else {
-		maxSP := 0.0
-		for _, s := range stats {
-			if s.CompletedSP > maxSP {
-				maxSP = s.CompletedSP
-			}
-		}
-		// Render most-recent first
-		for i := len(stats) - 1; i >= 0; i-- {
-			s := stats[i]
-			bar := spBar(s.CompletedSP, maxSP, 12)
-			stateTag := ""
-			if strings.ToLower(s.Sprint.State) == "active" {
-				stateTag = dimStyle.Render(" [active]")
-			}
-			line := fmt.Sprintf("  %-26s %-13s%5.0f SP  (%d done)%s\n",
-				truncateName(s.Sprint.Name, 26), bar, s.CompletedSP, s.CompletedCount, stateTag)
-			sb.WriteString(line)
-		}
-		sb.WriteString("\n")
-		trendLine := fmt.Sprintf("  Avg: %.0f SP/sprint   Recent avg: %.0f", histAvg, recentAvg)
-		switch trend {
-		case "down":
-			sb.WriteString(trendLine + "   " + warnStyle.Render("↓ lower than usual") + "\n\n")
-			sb.WriteString(warnStyle.Render("  ⚠  Velocity below average the last few sprints") + "\n")
-		case "up":
-			sb.WriteString(trendLine + "   " + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("↑ higher than usual") + "\n")
-		default:
-			sb.WriteString(trendLine + "   steady\n")
+		sb.WriteString(dimStyle.Render("  No sprint data available.\n\n"))
+		return sb.String()
+	}
+	maxSP := 0.0
+	for _, s := range stats {
+		if s.CompletedSP > maxSP {
+			maxSP = s.CompletedSP
 		}
 	}
+	for i := len(stats) - 1; i >= 0; i-- {
+		s := stats[i]
+		stateTag := ""
+		if strings.ToLower(s.Sprint.State) == "active" {
+			stateTag = dimStyle.Render(" [active]")
+		}
+		sb.WriteString(fmt.Sprintf("  %-26s %-13s%5.0f SP  (%d done)%s\n",
+			truncateName(s.Sprint.Name, 26), spBar(s.CompletedSP, maxSP, 12),
+			s.CompletedSP, s.CompletedCount, stateTag))
+	}
 	sb.WriteString("\n")
+	trendLine := fmt.Sprintf("  Avg: %.0f SP/sprint   Recent avg: %.0f", histAvg, recentAvg)
+	switch trend {
+	case "down":
+		sb.WriteString(trendLine + "   " + warnStyle.Render("↓ lower than usual") + "\n")
+	case "up":
+		sb.WriteString(trendLine + "   " + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("↑ higher than usual") + "\n")
+	default:
+		sb.WriteString(trendLine + "   steady\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
 
-	// Open Issues section
+func (m OneOnOneModel) renderOpenIssues() string {
+	var sb strings.Builder
 	baseURL := strings.TrimRight(m.cfg.Jira.BaseURL, "/")
-	sb.WriteString(bold.Render(fmt.Sprintf("Open Issues  (%d)", len(m.openIssues))) + "\n")
+	ageByKey := make(map[string]domain.OpenIssueAge, len(m.openAges))
+	for _, a := range m.openAges {
+		ageByKey[a.Key] = a
+	}
+
+	sb.WriteString(boldStyle.Render(fmt.Sprintf("Open Issues  (%d)", len(m.openIssues))) + "\n")
 	if len(m.openIssues) == 0 {
-		sb.WriteString(dimStyle.Render("  None — all clear.\n"))
-	} else {
-		for _, issue := range m.openIssues {
-			cat := statusCatLabel(issue.StatusCategory)
-			keyLink := jiraLink(issue.Key, baseURL+"/browse/"+issue.Key)
-			summary := truncateName(issue.Summary, 60)
-			sb.WriteString(fmt.Sprintf("  %-13s  %-12s  %s\n", cat, keyLink, summary))
+		sb.WriteString(dimStyle.Render("  None — all clear.\n\n"))
+		return sb.String()
+	}
+	for _, issue := range m.openIssues {
+		age := ""
+		if a, ok := ageByKey[issue.Key]; ok && a.DaysInStatus > 0 {
+			age = fmtDays(a.DaysInStatus)
+			if !a.Exact {
+				age = "~" + age
+			}
+			if a.DaysInStatus >= 14 {
+				age = warnStyle.Render(age)
+			} else {
+				age = dimStyle.Render(age)
+			}
 		}
-		if wlSignal == "very-high" {
-			sb.WriteString("\n" + warnStyle.Render("  ⚠  High number of in-progress items") + "\n")
-		} else if wlSignal == "high" {
-			sb.WriteString("\n" + warnStyle.Render("  ⚠  More in-flight than usual") + "\n")
-		}
+		sb.WriteString(fmt.Sprintf("  %-13s  %-12s  %-46s %s\n",
+			statusCatLabel(issue.StatusCategory),
+			jiraLink(issue.Key, baseURL+"/browse/"+issue.Key),
+			truncateName(issue.Summary, 46), age))
 	}
 	sb.WriteString("\n")
+	return sb.String()
+}
 
-	// Git Activity section
+func (m OneOnOneModel) renderGitActivity(weeks []domain.WeekCount,
+	avgCommits float64, thisWeek, activeWeeks, totalCommits int, commitsLow bool) string {
+
+	var sb strings.Builder
 	gitFilter := m.member.Email
 	if gitFilter == "" {
 		gitFilter = m.member.DisplayName
 	}
-	sb.WriteString(bold.Render("Git Activity") + "  (last 8 weeks)\n")
-	if len(m.team.Repos) == 0 {
-		sb.WriteString(dimStyle.Render("  No repositories configured for this team.\n"))
-	} else if len(weeks) == 0 {
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("  No commits found.  (filter: --author=%s)\n", gitFilter)))
-	} else {
-		maxCommits := 0
-		for _, w := range weeks {
-			if w.Count > maxCommits {
-				maxCommits = w.Count
-			}
+	sb.WriteString(boldStyle.Render("Git Activity") + "  (last 8 weeks)\n")
+
+	switch {
+	case len(m.team.Repos) == 0:
+		sb.WriteString(dimStyle.Render("  No repositories configured for this team.\n\n"))
+		return sb.String()
+	case totalCommits == 0:
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("  No commits found.  (filter: --author=%s)\n\n", gitFilter)))
+		return sb.String()
+	}
+
+	maxCommits := 0
+	for _, w := range weeks {
+		if w.Count > maxCommits {
+			maxCommits = w.Count
 		}
-		limit := 8
-		if len(weeks) < limit {
-			limit = len(weeks)
+	}
+	for _, w := range weeks {
+		bar := ""
+		if maxCommits > 0 && w.Count > 0 {
+			bar = strings.Repeat("█", int(math.Round(float64(w.Count)/float64(maxCommits)*10)))
 		}
-		var totalCommits int
-		for _, w := range weeks {
-			totalCommits += w.Count
-		}
-		avgCommits := 0
-		if len(weeks) > 0 {
-			avgCommits = totalCommits / len(weeks)
-		}
-		for _, w := range weeks[:limit] {
-			bar := strings.Repeat("█", int(math.Round(float64(w.Count)/float64(maxCommits)*10)))
-			sb.WriteString(fmt.Sprintf("  %-11s  %-11s %d commits\n", w.Label, bar, w.Count))
-		}
-		sb.WriteString("\n")
-		thisWeek := 0
-		if len(weeks) > 0 {
-			thisWeek = weeks[0].Count
-		}
-		weekLine := fmt.Sprintf("  Avg: %d commits/week   This week: %d", avgCommits, thisWeek)
-		if avgCommits > 0 && thisWeek < avgCommits/2 {
-			sb.WriteString(weekLine + "  " + warnStyle.Render("(below average)") + "\n")
-		} else {
-			sb.WriteString(weekLine + "\n")
-		}
+		sb.WriteString(fmt.Sprintf("  %-11s  %-11s %d commits\n", w.Label, bar, w.Count))
 	}
 	sb.WriteString("\n")
-
-	// DORA Metrics section
-	d := m.doraMetrics
-	if d.IssuesAnalyzed > 0 {
-		sb.WriteString(bold.Render(fmt.Sprintf("DORA Metrics  (90 days, %d issues)", d.IssuesAnalyzed)) + "\n")
-		if d.AvgCycleTimeDays > 0 {
-			sb.WriteString(fmt.Sprintf("  Cycle time:        %.1f days\n", d.AvgCycleTimeDays))
-		}
-		if d.AvgCodeReviewDays > 0 {
-			sb.WriteString(fmt.Sprintf("  Code review wait:  %.1f days\n", d.AvgCodeReviewDays))
-		}
-		reworkLine := fmt.Sprintf("  Rework incidents:  %d issues", d.ReworkCount)
-		if d.ReworkCount > 0 {
-			sb.WriteString(reworkLine + "  " + warnStyle.Render("⚠ worth discussing") + "\n")
-		} else {
-			sb.WriteString(reworkLine + "\n")
-		}
-		sb.WriteString("\n")
+	line := fmt.Sprintf("  Avg: %.1f/week over %d weeks (%d active)   This week: %d",
+		avgCommits, len(weeks), activeWeeks, thisWeek)
+	if commitsLow {
+		line += "  " + warnStyle.Render("(below average)")
 	}
-
-	// Talking Points
-	sb.WriteString(bold.Render("Talking Points") + "\n")
-	var points []string
-	if trend == "down" {
-		points = append(points, "Velocity has been below average for the last few sprints. Worth exploring blockers.")
-	}
-	if wlSignal != "" {
-		points = append(points, "More in-progress items than usual — watch for overload signals.")
-	}
-	if len(weeks) > 1 && weeks[0].Count < avgCommitsPerWeek(weeks)/2 {
-		points = append(points, "Lighter commit activity this week than recent average.")
-	}
-	if d.ReworkCount > 0 {
-		points = append(points, fmt.Sprintf("%d issue(s) required rework (status regressed after code review/testing).", d.ReworkCount))
-	}
-	if d.AvgCodeReviewDays > 2 {
-		points = append(points, fmt.Sprintf("Code review is averaging %.1f days — consider pairing or smaller PRs.", d.AvgCodeReviewDays))
-	}
-	if len(points) == 0 {
-		points = append(points, "No workload or velocity concerns this cycle.")
-	}
-	for _, p := range points {
-		sb.WriteString("  • " + p + "\n")
-	}
-
+	sb.WriteString(line + "\n\n")
 	return sb.String()
 }
 
-func avgCommitsPerWeek(weeks []struct {
-	Label string
-	Count int
-}) int {
-	if len(weeks) == 0 {
-		return 0
+func (m OneOnOneModel) renderMergeRequests() string {
+	return boldStyle.Render("Merge Requests") + "\n" +
+		dimStyle.Render("  Not available — GitLab access not configured.\n")
+}
+
+// topPhase returns the phase holding the largest share of cycle time.
+func topPhase(share domain.PhaseDurations) (domain.Phase, float64) {
+	var best domain.Phase
+	var bestVal float64
+	for _, p := range domain.PhaseOrder {
+		if share[p] > bestVal {
+			best, bestVal = p, share[p]
+		}
 	}
-	total := 0
-	for _, w := range weeks {
-		total += w.Count
+	return best, bestVal
+}
+
+// staleOpenIssues returns open issues stuck in one status beyond days.
+func staleOpenIssues(ages []domain.OpenIssueAge, days float64) []domain.OpenIssueAge {
+	var out []domain.OpenIssueAge
+	for _, a := range ages {
+		if a.DaysInStatus >= days {
+			out = append(out, a)
+		}
 	}
-	return total / len(weeks)
+	return out
 }
 
 func truncateName(s string, max int) string {

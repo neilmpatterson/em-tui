@@ -29,6 +29,7 @@ type TeamConfig struct {
 	IncomingBugs   string              `koanf:"incoming_bugs"`
 	SecurityIssues string              `koanf:"security_issues"`
 	WatchStatuses  []string            `koanf:"watch_statuses"`
+	Phases         map[string]string   `koanf:"phases"`
 }
 
 func (t TeamConfig) EffectiveWatchStatuses() []string {
@@ -36,6 +37,31 @@ func (t TeamConfig) EffectiveWatchStatuses() []string {
 		return t.WatchStatuses
 	}
 	return []string{"Testing", "Code Review", "Ready for QA"}
+}
+
+// defaultPhases maps status name to workflow phase. The names are the ones
+// actually in use on this Jira instance. The split that earns its keep is queue
+// vs active: "Ready for QA" and "Testing" are both category In Progress, but one
+// is a ticket waiting for a person and the other is a person working.
+var defaultPhases = map[string]string{
+	"In Progress":    "dev",
+	"Code Review":    "review",
+	"Ready to Merge": "awaiting_merge",
+	"Testing":        "qa",
+	"Ready for QA":   "awaiting_qa",
+	"Bug Fix Needed": "rework",
+	"On Hold":        "blocked",
+	"Blocked":        "blocked",
+}
+
+// EffectivePhases returns the configured status→phase map, or the defaults.
+// Statuses absent from the map fall back to keyword matching, so an unrecognised
+// status is surfaced as unclassified rather than silently dropped.
+func (t TeamConfig) EffectivePhases() map[string]string {
+	if len(t.Phases) > 0 {
+		return t.Phases
+	}
+	return defaultPhases
 }
 
 type Config struct {

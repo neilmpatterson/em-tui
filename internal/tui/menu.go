@@ -210,6 +210,7 @@ var (
 	dimStyle      = lipgloss.NewStyle().Faint(true)
 	separatorStyle = lipgloss.NewStyle().Faint(true)
 	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	boldStyle     = lipgloss.NewStyle().Bold(true)
 )
 
 func (m MainMenuModel) View() string {

@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	gojira "github.com/andygrunwald/go-jira"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/neilmpatterson/em-tui/internal/cache"
 	"github.com/neilmpatterson/em-tui/internal/domain"
 )
 
@@ -395,8 +395,8 @@ func (c *Client) searchIssues(jql string, maxResults int) ([]domain.JiraIssue, e
 type issueJSON struct {
 	Key    string `json:"key"`
 	Fields struct {
-		Summary  string `json:"summary"`
-		Status   struct {
+		Summary string `json:"summary"`
+		Status  struct {
 			Name           string `json:"name"`
 			StatusCategory struct {
 				Name string `json:"name"`
@@ -600,10 +600,10 @@ func (c *Client) fetchSprintPage(url string) ([]domain.Sprint, error) {
 
 // ghIssueJSON is the Jira GreenHopper sprint report issue shape.
 type ghIssueJSON struct {
-	Key          string `json:"key"`
-	Summary      string `json:"summary"`
-	AssigneeName string `json:"assigneeName"`
-	StatusName   string `json:"statusName"`
+	Key               string `json:"key"`
+	Summary           string `json:"summary"`
+	AssigneeName      string `json:"assigneeName"`
+	StatusName        string `json:"statusName"`
 	EstimateStatistic struct {
 		StatFieldValue *struct {
 			Value *float64 `json:"value"`
@@ -875,8 +875,8 @@ func (c *Client) FetchChangelogs(accountID string, issueKeys []string) tea.Cmd {
 			go func() {
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				transitions, err := c.fetchIssueStatusHistory(k)
-				ch <- result{domain.IssueChangelog{Key: k, Transitions: transitions}, err}
+				cl, err := c.fetchIssueChangelog(k)
+				ch <- result{cl, err}
 			}()
 		}
 		changelogs := make([]domain.IssueChangelog, 0, len(issueKeys))
@@ -891,11 +891,17 @@ func (c *Client) FetchChangelogs(accountID string, issueKeys []string) tea.Cmd {
 }
 
 type changelogResp struct {
+	Fields struct {
+		Created string `json:"created"`
+	} `json:"fields"`
 	Changelog struct {
+		Total     int `json:"total"`
 		Histories []struct {
 			Created string `json:"created"`
 			Items   []struct {
 				Field      string `json:"field"`
+				From       string `json:"from"`
+				To         string `json:"to"`
 				FromString string `json:"fromString"`
 				ToString   string `json:"toString"`
 			} `json:"items"`
@@ -903,39 +909,95 @@ type changelogResp struct {
 	} `json:"changelog"`
 }
 
-func (c *Client) fetchIssueStatusHistory(key string) ([]domain.StatusTransition, error) {
-	url := fmt.Sprintf("%s/rest/api/3/issue/%s?expand=changelog&fields=summary", c.baseURL, key)
+// fetchIssueChangelog fetches one issue's creation time and status-transition
+// history in a single request. Created anchors the segment before the first
+// transition, which is the issue's backlog time.
+func (c *Client) fetchIssueChangelog(key string) (domain.IssueChangelog, error) {
+	url := fmt.Sprintf("%s/rest/api/3/issue/%s?expand=changelog&fields=created", c.baseURL, key)
 	resp, err := c.http.Get(url)
 	if err != nil {
-		return nil, err
+		return domain.IssueChangelog{}, err
 	}
 	defer resp.Body.Close()
+	// Without this a 403 or 404 decodes cleanly into an empty changelog and the
+	// issue lands in the result set contributing nothing but inflating the count.
+	if resp.StatusCode >= 400 {
+		return domain.IssueChangelog{}, fmt.Errorf("jira: HTTP %d fetching changelog for %s", resp.StatusCode, key)
+	}
 	var data changelogResp
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, err
+		return domain.IssueChangelog{}, err
 	}
-	var transitions []domain.StatusTransition
+
+	cl := domain.IssueChangelog{Key: key}
+	cl.Created, _ = domain.ParseJiraTime(data.Fields.Created)
+	cl.Truncated = data.Changelog.Total > len(data.Changelog.Histories)
+
 	for _, h := range data.Changelog.Histories {
 		for _, item := range h.Items {
 			if item.Field != "status" {
 				continue
 			}
-			t, err := time.Parse("2006-01-02T15:04:05.000-0700", h.Created)
+			t, err := domain.ParseJiraTime(h.Created)
 			if err != nil {
-				t, err = time.Parse("2006-01-02T15:04:05-0700", h.Created)
-				if err != nil {
-					continue
-				}
+				continue
 			}
-			transitions = append(transitions, domain.StatusTransition{
+			cl.Transitions = append(cl.Transitions, domain.StatusTransition{
 				Timestamp: t,
 				From:      item.FromString,
 				To:        item.ToString,
+				FromID:    item.From,
+				ToID:      item.To,
 			})
 		}
 	}
-	sort.Slice(transitions, func(i, j int) bool {
-		return transitions[i].Timestamp.Before(transitions[j].Timestamp)
+	// Stable: several status items can share one history's timestamp, and an
+	// unstable sort would reorder them, breaking From/To adjacency and inventing
+	// rework transitions that never happened.
+	sort.SliceStable(cl.Transitions, func(i, j int) bool {
+		return cl.Transitions[i].Timestamp.Before(cl.Transitions[j].Timestamp)
 	})
-	return transitions, nil
+	return cl, nil
+}
+
+// StatusCategoriesResult carries the status ID → category name map.
+type StatusCategoriesResult struct {
+	ByID map[string]string
+	Err  error
+}
+
+// FetchStatusCategories loads every status on the site with its category. We key
+// by ID rather than name because names are not unique across a Jira site: this
+// instance has two distinct "On Hold" statuses in different categories, so a
+// name-keyed map would mis-bucket one of them.
+func (c *Client) FetchStatusCategories() tea.Cmd {
+	return func() tea.Msg {
+		if cached, err := cache.LoadStatusCategories(); err == nil && len(cached) > 0 {
+			return StatusCategoriesResult{ByID: cached}
+		}
+		url := fmt.Sprintf("%s/rest/api/3/status", c.baseURL)
+		resp, err := c.http.Get(url)
+		if err != nil {
+			return StatusCategoriesResult{Err: err}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return StatusCategoriesResult{Err: fmt.Errorf("jira: HTTP %d fetching statuses", resp.StatusCode)}
+		}
+		var data []struct {
+			ID             string `json:"id"`
+			StatusCategory struct {
+				Name string `json:"name"`
+			} `json:"statusCategory"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			return StatusCategoriesResult{Err: err}
+		}
+		byID := make(map[string]string, len(data))
+		for _, s := range data {
+			byID[s.ID] = s.StatusCategory.Name
+		}
+		go func() { _ = cache.SaveStatusCategories(byID) }()
+		return StatusCategoriesResult{ByID: byID}
+	}
 }
