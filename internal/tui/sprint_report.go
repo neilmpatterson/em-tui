@@ -48,7 +48,7 @@ func NewSprintReport(cfg *config.Config, teamIdx int, jiraClient *jira.Client, w
 		team = cfg.Teams[teamIdx]
 	}
 
-	const headerLines, footerLines = 2, 2
+	const headerLines, footerLines = 2, 3
 	vpHeight := height - headerLines - footerLines
 	if vpHeight < 5 {
 		vpHeight = 5
@@ -87,7 +87,7 @@ func (m SprintReportModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		const headerLines, footerLines = 2, 2
+		const headerLines, footerLines = 2, 3
 		vpHeight := msg.Height - headerLines - footerLines
 		if vpHeight < 5 {
 			vpHeight = 5
