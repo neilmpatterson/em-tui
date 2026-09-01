@@ -40,9 +40,13 @@ type OneOnOneModel struct {
 	openIssues     []domain.JiraIssue
 	commits        []domain.GitCommit
 
-	sprintsLoaded bool
-	issuesLoaded  bool
-	pendingCommits int
+	sprintsLoaded       bool
+	issuesLoaded        bool
+	pendingCommits      int
+	changelogsRequested bool
+	changelogsLoaded    bool
+
+	doraMetrics domain.MemberDORA
 
 	viewport viewport.Model
 	ready    bool
@@ -89,7 +93,8 @@ func (m OneOnOneModel) loading() bool {
 	if m.state == ooStateError {
 		return false
 	}
-	return !m.sprintsLoaded || !m.issuesLoaded || m.pendingCommits > 0 || m.pendingReports > 0
+	return !m.sprintsLoaded || !m.issuesLoaded || m.pendingCommits > 0 ||
+		m.pendingReports > 0 || !m.changelogsLoaded
 }
 
 func (m OneOnOneModel) Init() tea.Cmd {
@@ -146,6 +151,8 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sprintsLoaded = true
 		if len(msg.Sprints) == 0 {
 			m.pendingReports = 0
+			m.changelogsLoaded = true
+			m.changelogsRequested = true
 			m.finishIfDone()
 			return m, nil
 		}
@@ -170,6 +177,25 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingReports > 0 {
 			m.pendingReports--
 		}
+		// Fire changelog fetch once all sprint reports are in.
+		if m.pendingReports == 0 && !m.changelogsRequested {
+			m.changelogsRequested = true
+			keys := m.issueKeysForChangelog()
+			if len(keys) == 0 {
+				m.changelogsLoaded = true
+				m.finishIfDone()
+				return m, nil
+			}
+			return m, m.jiraClient.FetchChangelogs(m.member.AccountID, keys)
+		}
+		m.finishIfDone()
+		return m, nil
+
+	case jira.ChangelogsResult:
+		if msg.AccountID == m.member.AccountID {
+			m.doraMetrics = computeDORA(msg.Changelogs)
+		}
+		m.changelogsLoaded = true
 		m.finishIfDone()
 		return m, nil
 
@@ -249,6 +275,115 @@ func ooFetchOrLoadCached(boardID int, sprint domain.Sprint, client *jira.Client)
 }
 
 // --- Metric helpers ---
+
+// issueKeysForChangelog collects issue keys completed by this member in the last 90 days.
+func (m *OneOnOneModel) issueKeysForChangelog() []string {
+	cutoff := time.Now().AddDate(0, -3, 0)
+	seen := map[string]bool{}
+	var keys []string
+	for _, r := range m.sprintReports {
+		endDate, err := time.Parse("2006-01-02", r.Sprint.EndDate)
+		if err != nil || endDate.Before(cutoff) {
+			continue
+		}
+		for _, issue := range r.Completed {
+			if issue.Assignee == m.member.DisplayName && !seen[issue.Key] {
+				seen[issue.Key] = true
+				keys = append(keys, issue.Key)
+				if len(keys) >= 50 {
+					return keys
+				}
+			}
+		}
+	}
+	return keys
+}
+
+// computeDORA derives cycle time, code review wait, and rework count from issue changelogs.
+func computeDORA(changelogs []domain.IssueChangelog) domain.MemberDORA {
+	dora := domain.MemberDORA{IssuesAnalyzed: len(changelogs)}
+	var cycleTimes, reviewTimes []float64
+	for _, cl := range changelogs {
+		var firstActive, lastDone *time.Time
+		var enterReview *time.Time
+		reworked := false
+		for i := range cl.Transitions {
+			t := &cl.Transitions[i]
+			if isActiveStatus(t.To) && firstActive == nil {
+				ts := t.Timestamp
+				firstActive = &ts
+			}
+			if isDoneStatus(t.To) {
+				ts := t.Timestamp
+				lastDone = &ts
+			}
+			// Code review timing
+			if isCodeReviewStatus(t.To) {
+				ts := t.Timestamp
+				enterReview = &ts
+			} else if enterReview != nil && isCodeReviewStatus(t.From) {
+				d := t.Timestamp.Sub(*enterReview).Hours() / 24
+				if d > 0 {
+					reviewTimes = append(reviewTimes, d)
+				}
+				enterReview = nil
+			}
+			// Rework detection
+			if !reworked && isReworkTransition(t.From, t.To) {
+				reworked = true
+				dora.ReworkCount++
+			}
+		}
+		if firstActive != nil && lastDone != nil && lastDone.After(*firstActive) {
+			cycleTimes = append(cycleTimes, lastDone.Sub(*firstActive).Hours()/24)
+		}
+	}
+	if len(cycleTimes) > 0 {
+		var sum float64
+		for _, d := range cycleTimes {
+			sum += d
+		}
+		dora.AvgCycleTimeDays = sum / float64(len(cycleTimes))
+	}
+	if len(reviewTimes) > 0 {
+		var sum float64
+		for _, d := range reviewTimes {
+			sum += d
+		}
+		dora.AvgCodeReviewDays = sum / float64(len(reviewTimes))
+	}
+	return dora
+}
+
+func isActiveStatus(s string) bool {
+	sl := strings.ToLower(s)
+	return strings.Contains(sl, "progress") || strings.Contains(sl, "development") ||
+		strings.Contains(sl, "started") || sl == "open"
+}
+
+func isDoneStatus(s string) bool {
+	sl := strings.ToLower(s)
+	return sl == "done" || sl == "closed" || sl == "resolved" ||
+		strings.Contains(sl, "complete")
+}
+
+func isCodeReviewStatus(s string) bool {
+	sl := strings.ToLower(s)
+	return strings.Contains(sl, "code review") || strings.Contains(sl, "in review") ||
+		strings.Contains(sl, "peer review")
+}
+
+func isReworkTransition(from, to string) bool {
+	fromLow, toLow := strings.ToLower(from), strings.ToLower(to)
+	laterStatus := strings.Contains(fromLow, "review") || strings.Contains(fromLow, "test") ||
+		strings.Contains(fromLow, "qa") || strings.Contains(fromLow, "done") ||
+		strings.Contains(fromLow, "closed") || strings.Contains(fromLow, "resolv") ||
+		strings.Contains(fromLow, "accept")
+	reworkTarget := toLow == "in progress" || strings.Contains(toLow, "fix") ||
+		strings.Contains(toLow, "rework") || strings.Contains(toLow, "revise") ||
+		strings.Contains(toLow, "reopen")
+	return laterStatus && reworkTarget
+}
 
 func memberStatsFromReports(displayName string, reports []domain.SprintReportData) []domain.MemberSprintStats {
 	stats := make([]domain.MemberSprintStats, 0, len(reports))
@@ -505,6 +640,25 @@ func (m OneOnOneModel) renderContent() string {
 	}
 	sb.WriteString("\n")
 
+	// DORA Metrics section
+	d := m.doraMetrics
+	if d.IssuesAnalyzed > 0 {
+		sb.WriteString(bold.Render(fmt.Sprintf("DORA Metrics  (90 days, %d issues)", d.IssuesAnalyzed)) + "\n")
+		if d.AvgCycleTimeDays > 0 {
+			sb.WriteString(fmt.Sprintf("  Cycle time:        %.1f days\n", d.AvgCycleTimeDays))
+		}
+		if d.AvgCodeReviewDays > 0 {
+			sb.WriteString(fmt.Sprintf("  Code review wait:  %.1f days\n", d.AvgCodeReviewDays))
+		}
+		reworkLine := fmt.Sprintf("  Rework incidents:  %d issues", d.ReworkCount)
+		if d.ReworkCount > 0 {
+			sb.WriteString(reworkLine + "  " + warnStyle.Render("⚠ worth discussing") + "\n")
+		} else {
+			sb.WriteString(reworkLine + "\n")
+		}
+		sb.WriteString("\n")
+	}
+
 	// Talking Points
 	sb.WriteString(bold.Render("Talking Points") + "\n")
 	var points []string
@@ -516,6 +670,12 @@ func (m OneOnOneModel) renderContent() string {
 	}
 	if len(weeks) > 1 && weeks[0].Count < avgCommitsPerWeek(weeks)/2 {
 		points = append(points, "Lighter commit activity this week than recent average.")
+	}
+	if d.ReworkCount > 0 {
+		points = append(points, fmt.Sprintf("%d issue(s) required rework (status regressed after code review/testing).", d.ReworkCount))
+	}
+	if d.AvgCodeReviewDays > 2 {
+		points = append(points, fmt.Sprintf("Code review is averaging %.1f days — consider pairing or smaller PRs.", d.AvgCodeReviewDays))
 	}
 	if len(points) == 0 {
 		points = append(points, "No workload or velocity concerns this cycle.")

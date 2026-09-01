@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	gojira "github.com/andygrunwald/go-jira"
 	tea "github.com/charmbracelet/bubbletea"
@@ -88,6 +89,13 @@ type SprintIssuesResult struct {
 type AllSprintIssuesResult struct {
 	Issues []domain.JiraIssue
 	Err    error
+}
+
+// ChangelogsResult carries status-transition histories for a batch of issues.
+type ChangelogsResult struct {
+	AccountID  string
+	Changelogs []domain.IssueChangelog
+	Err        error
 }
 
 // --- tea.Cmd factories ---
@@ -847,4 +855,87 @@ func sumSP(a, b *float64) *float64 {
 	}
 	v := va + vb
 	return &v
+}
+
+// FetchChangelogs fetches status-transition histories for a batch of issue keys.
+// Up to 10 requests run concurrently; per-issue errors are silently skipped.
+func (c *Client) FetchChangelogs(accountID string, issueKeys []string) tea.Cmd {
+	return func() tea.Msg {
+		if len(issueKeys) == 0 {
+			return ChangelogsResult{AccountID: accountID}
+		}
+		type result struct {
+			cl  domain.IssueChangelog
+			err error
+		}
+		sem := make(chan struct{}, 10)
+		ch := make(chan result, len(issueKeys))
+		for _, key := range issueKeys {
+			k := key
+			go func() {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				transitions, err := c.fetchIssueStatusHistory(k)
+				ch <- result{domain.IssueChangelog{Key: k, Transitions: transitions}, err}
+			}()
+		}
+		changelogs := make([]domain.IssueChangelog, 0, len(issueKeys))
+		for range issueKeys {
+			r := <-ch
+			if r.err == nil {
+				changelogs = append(changelogs, r.cl)
+			}
+		}
+		return ChangelogsResult{AccountID: accountID, Changelogs: changelogs}
+	}
+}
+
+type changelogResp struct {
+	Changelog struct {
+		Histories []struct {
+			Created string `json:"created"`
+			Items   []struct {
+				Field      string `json:"field"`
+				FromString string `json:"fromString"`
+				ToString   string `json:"toString"`
+			} `json:"items"`
+		} `json:"histories"`
+	} `json:"changelog"`
+}
+
+func (c *Client) fetchIssueStatusHistory(key string) ([]domain.StatusTransition, error) {
+	url := fmt.Sprintf("%s/rest/api/3/issue/%s?expand=changelog&fields=summary", c.baseURL, key)
+	resp, err := c.http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var data changelogResp
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+	var transitions []domain.StatusTransition
+	for _, h := range data.Changelog.Histories {
+		for _, item := range h.Items {
+			if item.Field != "status" {
+				continue
+			}
+			t, err := time.Parse("2006-01-02T15:04:05.000-0700", h.Created)
+			if err != nil {
+				t, err = time.Parse("2006-01-02T15:04:05-0700", h.Created)
+				if err != nil {
+					continue
+				}
+			}
+			transitions = append(transitions, domain.StatusTransition{
+				Timestamp: t,
+				From:      item.FromString,
+				To:        item.ToString,
+			})
+		}
+	}
+	sort.Slice(transitions, func(i, j int) bool {
+		return transitions[i].Timestamp.Before(transitions[j].Timestamp)
+	})
+	return transitions, nil
 }
