@@ -153,7 +153,7 @@ func (a App) handleNavigate(msg NavigateTo) (tea.Model, tea.Cmd) {
 		return a, a.standup.Init()
 	case ScreenOneOnOne:
 		p, _ := msg.Payload.(memberPayload)
-		a.oneOnOne = NewOneOnOne(a.cfg, p.team, a.jiraClient, p.member)
+		a.oneOnOne = NewOneOnOne(a.cfg, p.team, a.jiraClient, p.member, a.width, a.height)
 		return a, a.oneOnOne.Init()
 	case ScreenSprintReport:
 		teamIdx, _ := msg.Payload.(int)

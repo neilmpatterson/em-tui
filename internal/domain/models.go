@@ -56,6 +56,15 @@ type SprintIssueCompact struct {
 	FinalSP   *float64 // estimate at sprint end
 }
 
+// MemberSprintStats is the per-person slice of a single sprint report.
+type MemberSprintStats struct {
+	Sprint          Sprint
+	CompletedSP     float64
+	IncompleteSP    float64
+	CompletedCount  int
+	IncompleteCount int
+}
+
 // SprintReportData holds sprint report data from the GreenHopper API.
 type SprintReportData struct {
 	Sprint         Sprint
