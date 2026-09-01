@@ -99,12 +99,17 @@ func (m OneOnOneModel) Init() tea.Cmd {
 		return nil
 	}
 	since := time.Now().AddDate(0, 0, -56) // 8 weeks
+	// Use email for git --author filter; fall back to display name if email not set.
+	authorFilter := m.member.Email
+	if authorFilter == "" {
+		authorFilter = m.member.DisplayName
+	}
 	cmds := []tea.Cmd{
 		m.jiraClient.FetchRecentSprints(m.team.BoardID, 6),
 		m.jiraClient.IssuesAssignedTo(m.member.AccountID),
 	}
 	for _, repo := range m.team.Repos {
-		cmds = append(cmds, git.FetchCommits(m.member.AccountID, repo, m.member.Email, since))
+		cmds = append(cmds, git.FetchCommits(m.member.AccountID, repo, authorFilter, since))
 	}
 	return tea.Batch(cmds...)
 }
@@ -421,8 +426,8 @@ func (m OneOnOneModel) renderContent() string {
 			if strings.ToLower(s.Sprint.State) == "active" {
 				stateTag = dimStyle.Render(" [active]")
 			}
-			line := fmt.Sprintf("  %-14s %-13s%5.0f SP  (%d done)%s\n",
-				truncateName(s.Sprint.Name, 14), bar, s.CompletedSP, s.CompletedCount, stateTag)
+			line := fmt.Sprintf("  %-26s %-13s%5.0f SP  (%d done)%s\n",
+				truncateName(s.Sprint.Name, 26), bar, s.CompletedSP, s.CompletedCount, stateTag)
 			sb.WriteString(line)
 		}
 		sb.WriteString("\n")
@@ -440,13 +445,16 @@ func (m OneOnOneModel) renderContent() string {
 	sb.WriteString("\n")
 
 	// Open Issues section
+	baseURL := strings.TrimRight(m.cfg.Jira.BaseURL, "/")
 	sb.WriteString(bold.Render(fmt.Sprintf("Open Issues  (%d)", len(m.openIssues))) + "\n")
 	if len(m.openIssues) == 0 {
 		sb.WriteString(dimStyle.Render("  None — all clear.\n"))
 	} else {
 		for _, issue := range m.openIssues {
 			cat := statusCatLabel(issue.StatusCategory)
-			sb.WriteString(fmt.Sprintf("  %-13s  %s  %s\n", cat, issue.Key, issue.Summary))
+			keyLink := jiraLink(issue.Key, baseURL+"/browse/"+issue.Key)
+			summary := truncateName(issue.Summary, 60)
+			sb.WriteString(fmt.Sprintf("  %-13s  %-12s  %s\n", cat, keyLink, summary))
 		}
 		if wlSignal == "very-high" {
 			sb.WriteString("\n" + warnStyle.Render("  ⚠  High number of in-progress items") + "\n")
@@ -549,4 +557,10 @@ func statusCatLabel(cat string) string {
 	default:
 		return "To Do"
 	}
+}
+
+// jiraLink renders an OSC 8 hyperlink for terminals that support it (iTerm2, Kitty, WezTerm, Ghostty).
+// Falls back gracefully — unsupported terminals ignore the escape sequences.
+func jiraLink(text, url string) string {
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
