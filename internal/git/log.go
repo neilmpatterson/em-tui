@@ -1,6 +1,7 @@
 package git
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,9 +20,19 @@ type CommitResult struct {
 	Err       error
 }
 
+// expandTilde resolves a leading ~ to the user's home directory.
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
 // FetchCommits returns a Cmd that reads git log for authorEmail in repoPath since sinceDate.
 func FetchCommits(accountID, repoPath, authorEmail string, since time.Time) tea.Cmd {
 	return func() tea.Msg {
+		repoPath = expandTilde(repoPath)
 		repoName := filepath.Base(repoPath)
 		args := []string{
 			"-C", repoPath,
