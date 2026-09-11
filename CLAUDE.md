@@ -12,15 +12,15 @@ A setup wizard on first run walks through:
 3. Selecting a Jira board (scrum or kanban)
 4. Pointing to a local git repository
 
-Config is saved to `~/.config/em-tui/config.yaml` (gitignored equivalent of bug-butler's `config.yaml`).
+Config is saved to `~/.config/em-tui/config.yaml`.
 
 ## Stack
 
-- **Language**: Go (same pattern as `~/Projects/bug-butler`)
+- **Language**: Go
 - **TUI framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea) — Elm-like model/update/view architecture
 - **Styling**: [Lip Gloss](https://github.com/charmbracelet/lipgloss) for layout and color
 - **Jira**: `github.com/andygrunwald/go-jira`
-- **Config**: `github.com/knadh/koanf` (YAML, env var interpolation, same as bug-butler)
+- **Config**: `github.com/knadh/koanf` (YAML, env var interpolation)
 - **CLI bootstrap**: `github.com/spf13/cobra` (one command: `em-tui`, plus `--config` flag)
 
 ## Architecture
@@ -53,7 +53,7 @@ internal/
   tui/              # Bubble Tea models: app.go, standup.go, oneonone.go, etc.
   wizard/           # first-run setup wizard model
   config/           # koanf config load/save, including team/board persisted state
-  jira/             # Jira API wrapper (reuse patterns from bug-butler)
+  jira/             # Jira API wrapper
   git/              # git log reader (exec-based)
   domain/           # shared types: TeamMember, Sprint, BoardType, etc.
 ```
@@ -70,18 +70,18 @@ jira:
   api_token: "${JIRA_API_TOKEN}"
 
 teams:
-  - name: "CMS"
-    board_id: 1334
+  - name: "Platform"
+    board_id: 42
     board_type: "scrum"        # or "kanban"
     members:
       - account_id: "abc123"
         display_name: "Alice Smith"
         email: "alice@company.com"   # used as the git --author filter
     repos:
-      - "~/Projects/composer"        # tilde is expanded in git/log.go
-    projects: ["CMS"]
-    incoming_bugs: "22598"           # Jira filter ID
-    security_issues: "22597"
+      - "~/Projects/your-repo"       # tilde is expanded in git/log.go
+    projects: ["PLAT"]
+    incoming_bugs: "YOUR_FILTER_ID"  # Jira filter ID
+    security_issues: "YOUR_FILTER_ID"
     watch_statuses: ["Testing", "Code Review"]
     phases:                          # optional; see Flow metrics below
       "Bug Fix Needed": "rework"
@@ -97,8 +97,8 @@ The Cycle Time section is derived from Jira issue changelogs. Two rules matter:
 **Status category comes from Jira, keyed by status ID, never inferred from the
 name.** `/rest/api/3/status` is fetched once and cached to
 `~/.local/share/em-tui/status-categories.json` (7-day TTL). Names are *not*
-unique on a site: Finalsite has two "On Hold" statuses in different categories
-and 16 distinct "In Progress" IDs. Name-based matching previously classified
+unique on a site: some instances have two "On Hold" statuses in different
+categories and many distinct "In Progress" IDs. Name-based matching previously classified
 "Ready to Merge" as Done and "Deployment In Progress" as active development.
 
 **Phase is a finer split than the category**, and comes from the name via
@@ -163,7 +163,7 @@ go run ./cmd/em-tui --config ./config.dev.yaml
 ## Unfinished / next up
 
 **Phase 2 — git-side metrics for the 1:1 screen.** Researched and validated
-against `~/Projects/composer`, not yet built:
+against a real repo, not yet built:
 
 - *Commit size distribution* and *commits per ticket*. Use `--shortstat` over
   `--numstat` (730KB vs 1.26MB per 90 days; numstat costs a line per file). Show

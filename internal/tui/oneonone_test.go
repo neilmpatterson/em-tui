@@ -8,8 +8,8 @@ import (
 	"github.com/neilmpatterson/em-tui/internal/domain"
 )
 
-// realStatusIDs are actual status IDs and categories from the Finalsite Jira
-// instance. Note "On Hold" appears twice with different categories, and
+// realStatusIDs are status IDs and categories from a real Jira instance
+// (anonymised). Note "On Hold" appears twice with different categories, and
 // "In Progress" has many IDs across projects — which is exactly why the phase
 // lookup keys on ID rather than name.
 var realStatusIDs = map[string]string{
@@ -156,15 +156,15 @@ func TestIssueCycleReworkSplit(t *testing.T) {
 	}
 }
 
-// TestIssueCycleStopsAtFirstDone pins the real shape of CMS-20450: the ticket
-// reached "Ready to Deploy" (a Done-category status) and then sat there for six
-// weeks before anyone flipped it to Closed. Cycle time must stop at the first
-// Done entry, matching `statusCategory IN (Done)`, or the number is dominated by
-// release-train latency that has nothing to do with the assignee.
+// TestIssueCycleStopsAtFirstDone covers a ticket that reached "Ready to Deploy"
+// (a Done-category status) and then sat there for six weeks before anyone
+// flipped it to Closed. Cycle time must stop at the first Done entry, matching
+// `statusCategory IN (Done)`, or the number is dominated by release-train
+// latency that has nothing to do with the assignee.
 func TestIssueCycleStopsAtFirstDone(t *testing.T) {
 	m := testModel()
 	cl := domain.IssueChangelog{
-		Key:     "CMS-20450",
+		Key:     "ACME-100",
 		Created: day(0),
 		Transitions: []domain.StatusTransition{
 			tr(1, "10716", "Backlog", "3", "In Progress"),

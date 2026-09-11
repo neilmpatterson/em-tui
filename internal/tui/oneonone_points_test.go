@@ -11,32 +11,32 @@ import (
 func smokeModel() OneOnOneModel {
 	sp := func(v float64) *float64 { return &v }
 	m := OneOnOneModel{
-		cfg:     &config.Config{Jira: config.JiraConfig{BaseURL: "https://finalsiteinc.atlassian.net"}},
-		team:    config.TeamConfig{Name: "CMS"},
-		member:  domain.TeamMember{DisplayName: "John Boker"},
+		cfg:     &config.Config{Jira: config.JiraConfig{BaseURL: "https://acme.atlassian.net"}},
+		team:    config.TeamConfig{Name: "Platform"},
+		member:  domain.TeamMember{DisplayName: "Alex Chen"},
 		catByID: realStatusIDs,
 		width:   100,
 		openIssues: []domain.JiraIssue{
-			{Key: "CMS-21622", Summary: "Session cf_id guard for V2 endpoints", Status: "In Progress", StatusCategory: "In Progress"},
-			{Key: "MSG-1666", Summary: "Legacy feed parser migration", Status: "In Progress", StatusCategory: "In Progress"},
+			{Key: "ACME-101", Summary: "Add OAuth2 refresh token support", Status: "In Progress", StatusCategory: "In Progress"},
+			{Key: "ACME-102", Summary: "Migrate legacy queue processor", Status: "In Progress", StatusCategory: "In Progress"},
 		},
 		openAges: []domain.OpenIssueAge{
-			{Key: "CMS-21622", DaysInStatus: 3, Exact: true},
-			{Key: "MSG-1666", DaysInStatus: 61, Exact: true},
+			{Key: "ACME-101", DaysInStatus: 3, Exact: true},
+			{Key: "ACME-102", DaysInStatus: 61, Exact: true},
 		},
 		sprintReports: []domain.SprintReportData{{
-			Sprint: domain.Sprint{Name: "Stability Sprint 2026.Q3.3", State: "closed", StartDate: "2026-08-01", EndDate: "2026-08-14"},
+			Sprint: domain.Sprint{Name: "Platform Q4.1", State: "closed", StartDate: "2026-08-01", EndDate: "2026-08-14"},
 			Completed: []domain.SprintIssueCompact{
-				{Key: "CMS-20450", Summary: "Playwright coverage for V2 session guard", Assignee: "John Boker", Status: "Closed", FinalSP: sp(3)},
-				{Key: "CMS-21394", Summary: "Loop cadence videos through slideshow", Assignee: "John Boker", Status: "Closed", FinalSP: sp(5)},
+				{Key: "ACME-103", Summary: "Add rate limiting to public API", Assignee: "Alex Chen", Status: "Done", FinalSP: sp(3)},
+				{Key: "ACME-104", Summary: "Refactor background job scheduler", Assignee: "Alex Chen", Status: "Done", FinalSP: sp(5)},
 			},
 			NotCompleted: []domain.SprintIssueCompact{
-				{Key: "CMS-21501", Summary: "Rework slideshow timing state machine", Assignee: "John Boker", Status: "Bug Fix Needed", FinalSP: sp(8)},
+				{Key: "ACME-105", Summary: "Rework retry state machine", Assignee: "Alex Chen", Status: "Bug Fix Needed", FinalSP: sp(8)},
 			},
 		}},
 		flow: domain.MemberFlow{
 			IssuesAnalyzed: 12, IssuesCompleted: 10,
-			P50CycleDays: 4.1, P90CycleDays: 31.2, MaxCycleDays: 61, MaxCycleKey: "CMS-20450",
+			P50CycleDays: 4.1, P90CycleDays: 31.2, MaxCycleDays: 61, MaxCycleKey: "ACME-103",
 			CycleDays:      []float64{1, 2, 3, 4, 4, 5, 8, 12, 30, 61},
 			AvgPhase:       domain.PhaseDurations{domain.PhaseDev: 3.2, domain.PhaseReview: 1.8, domain.PhaseAwaitingQA: 19.4, domain.PhaseQA: 1.1},
 			PhaseShare:     domain.PhaseDurations{domain.PhaseDev: 0.13, domain.PhaseReview: 0.07, domain.PhaseAwaitingQA: 0.76, domain.PhaseQA: 0.04},
@@ -45,9 +45,9 @@ func smokeModel() OneOnOneModel {
 			ThroughputPerWeek: 2.9, WindowWeeks: 13,
 			UnknownStatuses: []string{"Spike"},
 			Issues: []domain.IssueCycle{
-				{Key: "CMS-20450", CycleDays: 61, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 27}, QABounces: 2},
-				{Key: "CMS-21394", CycleDays: 30, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 12}, Reopened: 1},
-				{Key: "CMS-21501", CycleDays: 4, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 3}, QABounces: 1},
+				{Key: "ACME-103", CycleDays: 61, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 27}, QABounces: 2},
+				{Key: "ACME-104", CycleDays: 30, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 12}, Reopened: 1},
+				{Key: "ACME-105", CycleDays: 4, Phases: domain.PhaseDurations{domain.PhaseAwaitingQA: 3}, QABounces: 1},
 			},
 		},
 	}
@@ -98,7 +98,7 @@ func TestSelectionMarkerTracksSelectedPoint(t *testing.T) {
 	lines := strings.Split(out, "\n")
 	var marked int
 	for _, l := range lines {
-		if strings.Contains(l, "\u25b8") {
+		if strings.Contains(l, "▸") {
 			marked++
 		}
 	}
@@ -107,7 +107,7 @@ func TestSelectionMarkerTracksSelectedPoint(t *testing.T) {
 	}
 	// Scroll focus shows no marker at all.
 	m.focus = ooFocusScroll
-	if strings.Contains(m.renderTalkingPoints(), "\u25b8") {
+	if strings.Contains(m.renderTalkingPoints(), "▸") {
 		t.Error("marker rendered while focus is on scrolling")
 	}
 }
@@ -127,16 +127,16 @@ func TestDetailTableListsTheRightTickets(t *testing.T) {
 	m.state = ooStateDetail
 	m.detailIdx = idx
 	out := m.renderDetail()
-	for _, want := range []string{"CMS-20450", "CMS-21501", "BOUNCES"} {
+	for _, want := range []string{"ACME-103", "ACME-105", "BOUNCES"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("detail view missing %q", want)
 		}
 	}
-	if strings.Contains(out, "CMS-21394") {
-		t.Error("detail view lists CMS-21394, which was reopened, not QA-bounced")
+	if strings.Contains(out, "ACME-104") {
+		t.Error("detail view lists ACME-104, which was reopened, not QA-bounced")
 	}
 	// Summaries come from the sprint reports, not a second fetch.
-	if !strings.Contains(out, "Playwright coverage") {
+	if !strings.Contains(out, "rate limiting") {
 		t.Error("detail view missing the summary looked up from sprint reports")
 	}
 }

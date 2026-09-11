@@ -167,8 +167,8 @@ teams:
     repos:
       - "~/Projects/platform"       # tilde-expanded; supports multiple repos
     projects: ["PLAT"]              # Jira project keys for this team
-    incoming_bugs: "22598"          # optional: Jira filter ID for bug triage
-    security_issues: "22597"        # optional: Jira filter ID for security tickets
+    incoming_bugs: "YOUR_FILTER_ID"  # optional: Jira filter ID for bug triage
+    security_issues: "YOUR_FILTER_ID" # optional: Jira filter ID for security tickets
     watch_statuses:                 # statuses to highlight in standup
       - "Testing"
       - "Code Review"
