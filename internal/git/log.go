@@ -37,6 +37,16 @@ type CommitDirResult struct {
 	Err       error
 }
 
+// dirKey returns the grouping key for a file path: the first two segments joined
+// with "/" when depth >= 3, or just the first segment otherwise.
+func dirKey(path string) string {
+	segs := strings.SplitN(path, "/", 3)
+	if len(segs) >= 3 {
+		return segs[0] + "/" + segs[1]
+	}
+	return segs[0]
+}
+
 // FetchCommitDirs returns a Cmd that groups commits by top-level directory for
 // authorEmail in repoPath since sinceDate. Uses --numstat to get per-file paths.
 func FetchCommitDirs(accountID, repoPath, authorEmail string, since time.Time) tea.Cmd {
@@ -69,18 +79,7 @@ func FetchCommitDirs(accountID, repoPath, authorEmail string, since time.Time) t
 			if path == "" {
 				continue
 			}
-			// Use up to two path segments so "engines/calendar_manager/foo.rb"
-			// groups as "engines/calendar_manager" rather than just "engines".
-			segs := strings.SplitN(path, "/", 3)
-			var dir string
-			if len(segs) >= 3 {
-				dir = segs[0] + "/" + segs[1]
-			} else if len(segs) == 2 {
-				dir = segs[0]
-			} else {
-				dir = segs[0]
-			}
-			counts[dir]++
+			counts[dirKey(path)]++
 		}
 		dirs := make([]domain.DirStat, 0, len(counts))
 		for d, c := range counts {
