@@ -4,6 +4,8 @@ A terminal dashboard for engineering managers. Connects to Jira and git to
 surface the context you need for standups, 1:1s, sprint reviews, and perf
 calibration — without leaving the terminal.
 
+![em-tui demo](docs/em-tui-demo.gif)
+
 ## Screens
 
 ### Main Menu
