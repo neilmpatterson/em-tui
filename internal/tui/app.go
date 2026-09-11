@@ -85,6 +85,18 @@ func New(cfg *config.Config, cfgPath string, forceWizard bool) App {
 	}
 }
 
+// NewDemo builds an App pre-wired with a mock jira client and no wizard.
+func NewDemo(cfg *config.Config, jiraClient *jira.Client) App {
+	return App{
+		screen:     ScreenMainMenu,
+		cfg:        cfg,
+		cfgPath:    "",
+		jiraClient: jiraClient,
+		wizard:     wizard.New(cfg),
+		mainMenu:   NewMainMenu(cfg),
+	}
+}
+
 func (a App) Init() tea.Cmd {
 	if a.screen == ScreenWizard {
 		return a.wizard.Init()

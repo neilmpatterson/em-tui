@@ -13,6 +13,7 @@ import (
 	gojira "github.com/andygrunwald/go-jira"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/neilmpatterson/em-tui/internal/cache"
+	"github.com/neilmpatterson/em-tui/internal/demo"
 	"github.com/neilmpatterson/em-tui/internal/domain"
 )
 
@@ -53,6 +54,18 @@ func New(baseURL, email, token string) (*Client, error) {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    httpClient,
 	}, nil
+}
+
+// NewDemo returns a Client backed by an in-process mock transport.
+// No network calls are made; all responses are pre-baked fake Acme Corp data.
+func NewDemo() *Client {
+	httpClient := &http.Client{Transport: demo.NewTransport()}
+	c, _ := gojira.NewClient(httpClient, "https://acme.atlassian.net")
+	return &Client{
+		jira:    c,
+		baseURL: "https://acme.atlassian.net",
+		http:    httpClient,
+	}
 }
 
 // --- Result message types ---
