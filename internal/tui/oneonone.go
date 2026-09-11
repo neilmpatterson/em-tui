@@ -254,7 +254,7 @@ func (m OneOnOneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, iss := range m.openIssues {
 				openKeys[iss.Key] = true
 			}
-			m.flow = m.computeFlow(msg.Changelogs, openKeys, m.changelogWindowFrom, now)
+			m.flow = m.fc().computeFlow(msg.Changelogs, openKeys, m.changelogWindowFrom, now)
 			m.openAges = openIssueAges(m.openIssues, byKey, now)
 		}
 		m.changelogsLoaded = true
@@ -572,11 +572,11 @@ func (m *OneOnOneModel) issueKeysForChangelog() ([]string, time.Time) {
 // category returns the Jira status category for a transition endpoint. The ID is
 // authoritative; the name is only a fallback for the rare transition where Jira
 // omits the ID (some creation paths) or the status map failed to load.
-func (m OneOnOneModel) category(id, name string) string {
-	if c, ok := m.catByID[id]; ok {
-		return c
-	}
-	return guessCategory(name)
+// fc builds a flowComputer from the model's loaded status-category map and the
+// team's effective phase table. Both are set during loading and do not change
+// after that, so it is safe to call from Update or any render helper.
+func (m OneOnOneModel) fc() flowComputer {
+	return flowComputer{catByID: m.catByID, phases: m.team.EffectivePhases()}
 }
 
 // guessCategory is the keyword fallback for when the status map is unavailable.
@@ -597,36 +597,6 @@ func guessCategory(name string) string {
 		return domain.CatTodo
 	}
 	return domain.CatInProgress
-}
-
-// phaseOf buckets a status into a workflow phase. The category decides the Todo
-// and Done boundaries (exact, from Jira); the name table decides the finer split
-// within In Progress. A status in neither returns PhaseUnknown and is reported,
-// never silently folded into a neighbouring bucket.
-func (m OneOnOneModel) phaseOf(id, name string) domain.Phase {
-	switch m.category(id, name) {
-	case domain.CatDone:
-		return domain.PhaseDone
-	case domain.CatTodo:
-		return domain.PhaseTodo
-	}
-	switch m.team.EffectivePhases()[strings.TrimSpace(name)] {
-	case "dev":
-		return domain.PhaseDev
-	case "review":
-		return domain.PhaseReview
-	case "awaiting_merge":
-		return domain.PhaseAwaitingMerge
-	case "qa":
-		return domain.PhaseQA
-	case "awaiting_qa":
-		return domain.PhaseAwaitingQA
-	case "rework":
-		return domain.PhaseRework
-	case "blocked":
-		return domain.PhaseBlocked
-	}
-	return phaseByKeyword(name)
 }
 
 // phaseByKeyword is the fallback for In Progress statuses absent from the phase
@@ -657,230 +627,6 @@ func phaseByKeyword(name string) domain.Phase {
 	return domain.PhaseUnknown
 }
 
-// issueCycle walks one issue's transitions, attributing each interval to the
-// phase the issue sat in during that interval. Returns the cycle plus any status
-// names no classifier recognised.
-func (m OneOnOneModel) issueCycle(cl domain.IssueChangelog, open bool, now time.Time) (domain.IssueCycle, []string) {
-	c := domain.IssueCycle{Key: cl.Key, Phases: domain.PhaseDurations{}}
-	tr := cl.Transitions
-	var unknown []string
-	note := func(name string, p domain.Phase) {
-		if p == domain.PhaseUnknown && strings.TrimSpace(name) != "" {
-			unknown = append(unknown, name)
-		}
-	}
-	if len(tr) == 0 {
-		return c, unknown
-	}
-
-	// Leading segment: created → first transition. Without this the backlog wait
-	// we are specifically trying to expose goes unattributed. An empty From on the
-	// first change means the initial status, which is overwhelmingly To Do.
-	if !cl.Created.IsZero() {
-		p := domain.PhaseTodo
-		if strings.TrimSpace(tr[0].From) != "" {
-			p = m.phaseOf(tr[0].FromID, tr[0].From)
-			note(tr[0].From, p)
-		}
-		c.Phases.Add(p, tr[0].Timestamp.Sub(cl.Created).Hours()/24)
-	}
-
-	for i := range tr {
-		p := m.phaseOf(tr[i].ToID, tr[i].To)
-		note(tr[i].To, p)
-
-		if c.Start.IsZero() && p.IsWorking() {
-			c.Start = tr[i].Timestamp
-		}
-		switch {
-		case p == domain.PhaseDone && c.Done.IsZero():
-			// First entry into the Done category ends the clock, so a ticket that
-			// reaches "Ready to Deploy" and then sits there for six weeks before
-			// someone flips it to Closed is not charged for the wait. This matches
-			// `statusCategory IN (Done)`.
-			c.Done = tr[i].Timestamp
-			c.Completed = true
-		case p != domain.PhaseDone && !c.Done.IsZero():
-			// Left the Done category again: the earlier completion didn't stick,
-			// so restart and let the next one count.
-			c.Done = time.Time{}
-			c.Completed = false
-		}
-		if m.isReopen(tr[i]) {
-			c.Reopened++
-		}
-		if m.isQABounce(tr[i]) {
-			c.QABounces++
-		}
-
-		var until time.Time
-		switch {
-		case i+1 < len(tr):
-			until = tr[i+1].Timestamp
-		case open && p != domain.PhaseDone:
-			until = now
-		default:
-			continue // terminal, or a closed issue with nothing after
-		}
-		c.Phases.Add(p, until.Sub(tr[i].Timestamp).Hours()/24)
-	}
-
-	if c.Completed && !c.Start.IsZero() && c.Done.After(c.Start) {
-		c.CycleDays = c.Done.Sub(c.Start).Hours() / 24
-	}
-	return c, unknown
-}
-
-// isReopen reports a regression out of a Done-category status back into work:
-// the ticket was declared finished and then wasn't.
-func (m OneOnOneModel) isReopen(t domain.StatusTransition) bool {
-	return m.category(t.FromID, t.From) == domain.CatDone &&
-		m.category(t.ToID, t.To) != domain.CatDone
-}
-
-// isQABounce reports a kick-back from QA or review to development or to an
-// explicit rework status such as "Bug Fix Needed".
-func (m OneOnOneModel) isQABounce(t domain.StatusTransition) bool {
-	from := m.phaseOf(t.FromID, t.From)
-	to := m.phaseOf(t.ToID, t.To)
-	fromLate := from == domain.PhaseQA || from == domain.PhaseAwaitingQA || from == domain.PhaseReview
-	toBack := to == domain.PhaseDev || to == domain.PhaseRework
-	return fromLate && toBack
-}
-
-// phasePasses returns one duration sample per entry into the given phase. Two
-// adjacent statuses in the same phase produce two samples, which is intended:
-// the old enter/exit pair silently lost the first interval when that happened.
-func (m OneOnOneModel) phasePasses(cl domain.IssueChangelog, want domain.Phase) []float64 {
-	var out []float64
-	tr := cl.Transitions
-	for i := 0; i+1 < len(tr); i++ {
-		if m.phaseOf(tr[i].ToID, tr[i].To) != want {
-			continue
-		}
-		if d := tr[i+1].Timestamp.Sub(tr[i].Timestamp).Hours() / 24; d > 0 {
-			out = append(out, d)
-		}
-	}
-	return out
-}
-
-// computeFlow folds the changelog batch into flow metrics. openKeys marks issues
-// still in flight: they contribute to rework counts (a ticket sitting in "Bug Fix
-// Needed" right now definitely bounced) but are excluded from cycle-time
-// percentiles and throughput, where an unfinished issue has no end.
-func (m OneOnOneModel) computeFlow(changelogs []domain.IssueChangelog, openKeys map[string]bool,
-	from, to time.Time) domain.MemberFlow {
-
-	f := domain.MemberFlow{AvgPhase: domain.PhaseDurations{}, PhaseShare: domain.PhaseDurations{}}
-	phaseSum := domain.PhaseDurations{}
-	unknownSeen := map[string]bool{}
-	var cycles []domain.IssueCycle
-
-	for _, cl := range changelogs {
-		open := openKeys[cl.Key]
-		c, unknown := m.issueCycle(cl, open, to)
-		for _, s := range unknown {
-			unknownSeen[s] = true
-		}
-		if cl.Truncated {
-			f.Truncated++
-		}
-
-		if c.Reopened > 0 {
-			f.ReopenedIssues++
-			f.ReopenedEvents += c.Reopened
-		}
-		if c.QABounces > 0 {
-			f.QABounceIssues++
-			f.QABounceEvents += c.QABounces
-		}
-		f.ReviewDays = append(f.ReviewDays, m.phasePasses(cl, domain.PhaseReview)...)
-		f.Issues = append(f.Issues, c)
-
-		if open {
-			continue
-		}
-		f.IssuesAnalyzed++
-		if c.CycleDays <= 0 {
-			continue
-		}
-		f.IssuesCompleted++
-		cycles = append(cycles, c)
-		f.CycleDays = append(f.CycleDays, c.CycleDays)
-		phaseSum.Merge(c.Phases)
-		if c.CycleDays > f.MaxCycleDays {
-			f.MaxCycleDays, f.MaxCycleKey = c.CycleDays, c.Key
-		}
-	}
-
-	sort.Float64s(f.CycleDays)
-	f.P50CycleDays = percentile(f.CycleDays, 50)
-	f.P90CycleDays = percentile(f.CycleDays, 90)
-	f.P50ReviewDays = percentile(f.ReviewDays, 50)
-
-	if f.IssuesCompleted > 0 {
-		f.AvgPhase = phaseSum.Scale(1 / float64(f.IssuesCompleted))
-	}
-	if total := phaseSum.Total(); total > 0 {
-		f.PhaseShare = phaseSum.Scale(1 / total)
-	}
-	f.DoneByWeek, f.WindowWeeks = doneByWeek(cycles, from, to)
-	if f.WindowWeeks > 0 {
-		f.ThroughputPerWeek = float64(len(cycles)) / f.WindowWeeks
-	}
-	for s := range unknownSeen {
-		f.UnknownStatuses = append(f.UnknownStatuses, s)
-	}
-	sort.Strings(f.UnknownStatuses)
-	return f
-}
-
-// percentile returns the p-th percentile (0..100) by nearest rank. vals must
-// already be sorted ascending.
-func percentile(vals []float64, p float64) float64 {
-	if len(vals) == 0 {
-		return 0
-	}
-	s := vals
-	if !sort.Float64sAreSorted(s) {
-		s = append([]float64(nil), vals...)
-		sort.Float64s(s)
-	}
-	idx := int(math.Ceil(p/100*float64(len(s)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(s) {
-		idx = len(s) - 1
-	}
-	return s[idx]
-}
-
-// doneByWeek buckets completed cycles into ISO weeks, most recent first, and
-// returns the window length in weeks. The window is passed in rather than
-// inferred from the data: inferring it understates the span whenever the member
-// finished nothing in the first or last week, which inflates throughput.
-func doneByWeek(cycles []domain.IssueCycle, from, to time.Time) ([]domain.WeekCount, float64) {
-	weeks := to.Sub(from).Hours() / 24 / 7
-	if weeks < 1 {
-		weeks = 1
-	}
-	counts := map[string]int{}
-	for _, c := range cycles {
-		if c.Done.IsZero() {
-			continue
-		}
-		y, w := c.Done.ISOWeek()
-		counts[fmt.Sprintf("%d-W%02d", y, w)]++
-	}
-	out := make([]domain.WeekCount, 0, len(counts))
-	for k, v := range counts {
-		out = append(out, domain.WeekCount{Label: k, Count: v})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Label > out[j].Label })
-	return out, weeks
-}
 
 // openIssueAges derives how long each open issue has sat in its present status.
 // Falls back to the issue's Updated date, flagged inexact, when the changelog is

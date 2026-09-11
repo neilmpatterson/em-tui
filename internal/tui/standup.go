@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/neilmpatterson/em-tui/internal/config"
 	"github.com/neilmpatterson/em-tui/internal/domain"
 	"github.com/neilmpatterson/em-tui/internal/jira"
@@ -477,34 +478,34 @@ func (m StandupModel) renderStatusTablePlain() string {
 	loading := m.pending[jira.SectionWatch] > 0
 	errMsg := m.sectionErrs[jira.SectionWatch]
 
-	const colStatus = 22
-	const colCount = 6
-	const indent = "  "
-	tableWidth := colStatus + colCount + 2
-	sep := indent + strings.Repeat("─", tableWidth)
+	if errMsg != "" {
+		return warnStyle.Render("  ⚠ "+errMsg) + "\n"
+	}
+	if loading {
+		return dimStyle.Render("  (loading...)") + "\n"
+	}
+
+	counts := make(map[string]int)
+	for _, iss := range m.issues[jira.SectionWatch] {
+		counts[iss.Status]++
+	}
+	if len(counts) == 0 {
+		return dimStyle.Render("  (none)") + "\n"
+	}
+
+	t := table.NewWriter()
+	t.SetStyle(table.StyleRounded)
+	t.AppendHeader(table.Row{"STATUS", "COUNT"})
+	for _, s := range sortByWorkflow(counts) {
+		t.AppendRow(table.Row{s, counts[s]})
+	}
 
 	var sb strings.Builder
-	sb.WriteString(dimStyle.Render(indent+fmt.Sprintf("%-*s %*s", colStatus, "STATUS", colCount, "COUNT")) + "\n")
-	sb.WriteString(sep + "\n")
-
-	if errMsg != "" {
-		sb.WriteString(warnStyle.Render(indent+"⚠ "+errMsg) + "\n")
-	} else if loading {
-		sb.WriteString(dimStyle.Render(indent+"(loading...)") + "\n")
-	} else {
-		counts := make(map[string]int)
-		for _, iss := range m.issues[jira.SectionWatch] {
-			counts[iss.Status]++
-		}
-		if len(counts) == 0 {
-			sb.WriteString(dimStyle.Render(indent+"(none)") + "\n")
-		} else {
-			for _, s := range sortByWorkflow(counts) {
-				sb.WriteString(normalStyle.Render(indent+fmt.Sprintf("%-*s %*d", colStatus, s, colCount, counts[s])) + "\n")
-			}
+	for _, line := range strings.Split(t.Render(), "\n") {
+		if line != "" {
+			sb.WriteString("  " + line + "\n")
 		}
 	}
-	sb.WriteString(sep + "\n")
 	return sb.String()
 }
 
@@ -674,38 +675,38 @@ func (m StandupModel) renderIssueTableRows(issues []domain.JiraIssue) string {
 	if w < 80 {
 		w = 100
 	}
-	const (
-		colKey      = 11
-		colPri      = 4
-		colStatus   = 16
-		colAssignee = 20
-		indent      = 2
-		gap         = 2
-	)
-	fixedWidth := indent + colKey + gap + colPri + gap + colStatus + gap + colAssignee + gap
-	colSummary := w - fixedWidth - 1
-	if colSummary < 8 {
-		colSummary = 8
+	// Fixed: key(11)+pri(6)+status(16)+assignee(20) + borders/gaps ~22
+	summaryW := w - 11 - 6 - 16 - 20 - 22
+	if summaryW < 20 {
+		summaryW = 20
 	}
-	sep := "  " + strings.Repeat("─", fixedWidth+colSummary-indent)
-	rowFmt := "  %-*s  %-*s  %-*s  %-*s  %s"
+
+	t := table.NewWriter()
+	t.SetStyle(table.StyleRounded)
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, WidthMax: 11},
+		{Number: 2, WidthMax: 6},
+		{Number: 3, WidthMax: 16},
+		{Number: 4, WidthMax: 20},
+		{Number: 5, WidthMax: summaryW},
+	})
+	t.AppendHeader(table.Row{"KEY", "PRI", "STATUS", "ASSIGNEE", "SUMMARY"})
+	for _, iss := range issues {
+		t.AppendRow(table.Row{
+			iss.Key,
+			priorityAbbr(iss.Priority),
+			iss.Status,
+			iss.Assignee,
+			iss.Summary,
+		})
+	}
 
 	var sb strings.Builder
-	sb.WriteString(sep + "\n")
-	sb.WriteString(dimStyle.Render(fmt.Sprintf(rowFmt, colKey, "KEY", colPri, "PRI", colStatus, "STATUS", colAssignee, "ASSIGNEE", "SUMMARY")) + "\n")
-	sb.WriteString(sep + "\n")
-
-	for _, iss := range issues {
-		row := fmt.Sprintf(rowFmt,
-			colKey, truncStr(iss.Key, colKey),
-			colPri, priorityAbbr(iss.Priority),
-			colStatus, truncStr(iss.Status, colStatus),
-			colAssignee, truncStr(iss.Assignee, colAssignee),
-			truncStr(iss.Summary, colSummary),
-		)
-		sb.WriteString(normalStyle.Render(row) + "\n")
+	for _, line := range strings.Split(t.Render(), "\n") {
+		if line != "" {
+			sb.WriteString("  " + line + "\n")
+		}
 	}
-	sb.WriteString(sep + "\n")
 	return sb.String()
 }
 

@@ -34,9 +34,36 @@ type JiraIssue struct {
 	Status         string
 	StatusCategory string // "To Do", "In Progress", "Done"
 	Priority       string
+	IssueType      string // "Bug", "Story", "Task", "Epic", etc.
 	Assignee       string
 	Updated        string
 	Created        string
+}
+
+// DirStat is a git directory and how many commits touched it.
+type DirStat struct {
+	Dir     string
+	Commits int
+}
+
+// DeveloperStats is the full 18-month picture for one team member.
+type DeveloperStats struct {
+	Member       TeamMember
+	WindowMonths int
+
+	// Ticket breakdown (Done issues in window)
+	ByIssueType   map[string]int // "Bug"→34, "Story"→12, "Task"→9
+	TotalResolved int
+
+	// Velocity (from sprint reports)
+	SprintHistory []MemberSprintStats // chronological
+
+	// Cycle time / flow
+	Flow MemberFlow
+
+	// Git
+	CommitsByDir []DirStat // sorted desc by commits
+	CommitsTotal int
 }
 
 // GitCommit is a single commit from git log.
@@ -54,6 +81,7 @@ type SprintIssueCompact struct {
 	Summary   string
 	Assignee  string
 	Status    string
+	Priority  string
 	InitialSP *float64 // estimate at sprint start; nil if not estimated
 	FinalSP   *float64 // estimate at sprint end
 }

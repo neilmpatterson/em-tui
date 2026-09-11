@@ -19,6 +19,7 @@ const (
 	ScreenOneOnOne
 	ScreenSprintReport
 	ScreenPerfReview
+	ScreenStats
 )
 
 // NavigateTo switches the active screen.
@@ -55,6 +56,7 @@ type App struct {
 	oneOnOne   OneOnOneModel
 	sprintRpt  SprintReportModel
 	perfReview PerfReviewModel
+	statsView  StatsModel
 
 	width  int
 	height int
@@ -170,6 +172,10 @@ func (a App) handleNavigate(msg NavigateTo) (tea.Model, tea.Cmd) {
 		p, _ := msg.Payload.(memberPayload)
 		a.perfReview = NewPerfReview(a.cfg, p.team, a.jiraClient, p.member)
 		return a, a.perfReview.Init()
+	case ScreenStats:
+		p, _ := msg.Payload.(memberPayload)
+		a.statsView = NewStats(a.cfg, p.team, a.jiraClient, p.member, a.width, a.height)
+		return a, a.statsView.Init()
 	case ScreenWizard:
 		a.wizard = wizard.New(a.cfg)
 		return a, a.wizard.Init()
@@ -204,6 +210,10 @@ func (a App) delegate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var m tea.Model
 		m, cmd = a.perfReview.Update(msg)
 		a.perfReview = m.(PerfReviewModel)
+	case ScreenStats:
+		var m tea.Model
+		m, cmd = a.statsView.Update(msg)
+		a.statsView = m.(StatsModel)
 	}
 	return a, cmd
 }
@@ -223,6 +233,8 @@ func (a App) View() string {
 		body = a.sprintRpt.View()
 	case ScreenPerfReview:
 		body = a.perfReview.View()
+	case ScreenStats:
+		body = a.statsView.View()
 	default:
 		body = fmt.Sprintf("unknown screen %d", a.screen)
 	}

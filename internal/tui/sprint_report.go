@@ -7,10 +7,32 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/neilmpatterson/em-tui/internal/cache"
 	"github.com/neilmpatterson/em-tui/internal/config"
 	"github.com/neilmpatterson/em-tui/internal/domain"
 	"github.com/neilmpatterson/em-tui/internal/jira"
+)
+
+// sectionStyle holds go-pretty color config for a sprint issue section.
+type sectionStyle struct {
+	header text.Colors
+	row    text.Colors
+	border text.Colors
+}
+
+var (
+	completedSectionStyle = sectionStyle{
+		header: text.Colors{text.BgGreen, text.FgBlack, text.Bold},
+		row:    text.Colors{text.FgHiGreen},
+		border: text.Colors{text.FgGreen},
+	}
+	notCompletedSectionStyle = sectionStyle{
+		header: text.Colors{text.BgYellow, text.FgBlack, text.Bold},
+		row:    text.Colors{text.FgHiYellow},
+		border: text.Colors{text.FgYellow},
+	}
 )
 
 type sprintViewState int
@@ -293,10 +315,10 @@ func (m SprintReportModel) renderReport() string {
 		sb.WriteString(m.renderContributors(r) + "\n")
 	}
 
-	sb.WriteString(m.renderIssueSection("Completed", r.Completed, r.AddedMidSprint, w))
-	sb.WriteString(m.renderIssueSection("Not Completed", r.NotCompleted, r.AddedMidSprint, w))
+	sb.WriteString(m.renderIssueSection("Completed", r.Completed, r.AddedMidSprint, w, completedSectionStyle))
+	sb.WriteString(m.renderIssueSection("Not Completed", r.NotCompleted, r.AddedMidSprint, w, notCompletedSectionStyle))
 	if len(r.Punted) > 0 {
-		sb.WriteString(m.renderIssueSection("Removed from Sprint", r.Punted, nil, w))
+		sb.WriteString(m.renderIssueSection("Removed from Sprint", r.Punted, nil, w, sectionStyle{}))
 	}
 
 	return sb.String()
@@ -471,26 +493,13 @@ func (m SprintReportModel) renderContributors(r domain.SprintReportData) string 
 		}
 	}
 
-	var sb strings.Builder
-	sb.WriteString(titleStyle.Render("  Contributors") + "\n")
-
-	const (
-		colName = 22
-		colDone = 20
-		colOpen = 20
-	)
-	sep := "  " + strings.Repeat("─", colName+colDone+colOpen+4)
-
-	sb.WriteString(sep + "\n")
+	t := table.NewWriter()
+	t.SetStyle(table.StyleRounded)
 	if hasSP {
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("  %-*s  %-*s  %s",
-			colName, "ASSIGNEE", colDone, "COMPLETED", "INCOMPLETE")) + "\n")
+		t.AppendHeader(table.Row{"ASSIGNEE", "COMPLETED", "INCOMPLETE"})
 	} else {
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("  %-*s  %-*s  %s",
-			colName, "ASSIGNEE", colDone, "DONE", "INCOMPLETE")) + "\n")
+		t.AppendHeader(table.Row{"ASSIGNEE", "DONE", "INCOMPLETE"})
 	}
-	sb.WriteString(sep + "\n")
-
 	for _, s := range sorted {
 		var doneStr, openStr string
 		if hasSP {
@@ -508,18 +517,21 @@ func (m SprintReportModel) renderContributors(r domain.SprintReportData) string 
 				openStr = "—"
 			}
 		}
-		row := fmt.Sprintf("  %-*s  %-*s  %s",
-			colName, truncStr(s.name, colName),
-			colDone, truncStr(doneStr, colDone),
-			openStr,
-		)
-		sb.WriteString(normalStyle.Render(row) + "\n")
+		t.AppendRow(table.Row{s.name, doneStr, openStr})
 	}
-	sb.WriteString(sep + "\n")
+
+	var sb strings.Builder
+	sb.WriteString(titleStyle.Render("  Contributors") + "\n")
+	for _, line := range strings.Split(t.Render(), "\n") {
+		if line != "" {
+			sb.WriteString("  " + line + "\n")
+		}
+	}
+	sb.WriteString("\n")
 	return sb.String()
 }
 
-func (m SprintReportModel) renderIssueSection(title string, issues []domain.SprintIssueCompact, addedKeys map[string]bool, w int) string {
+func (m SprintReportModel) renderIssueSection(title string, issues []domain.SprintIssueCompact, addedKeys map[string]bool, w int, style sectionStyle) string {
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render(fmt.Sprintf("  %s  (%d)", title, len(issues))) + "\n")
 
@@ -528,50 +540,64 @@ func (m SprintReportModel) renderIssueSection(title string, issues []domain.Spri
 		return sb.String()
 	}
 
-	const (
-		colKey      = 11
-		colAssignee = 16
-		colSP       = 4
-		indent      = 2
-		markW       = 2
-		gapW        = 2
-	)
-	fixedW := indent + markW + colKey + gapW + colAssignee + gapW + colSP + gapW
-	colSummary := w - fixedW - 2
-	if colSummary < 8 {
-		colSummary = 8
+	// Fixed: mark(1)+key(11)+assignee(16)+status(16)+priority(8)+sp(4) + borders/gaps ~24
+	summaryW := w - 1 - 11 - 16 - 16 - 8 - 4 - 24
+	if summaryW < 20 {
+		summaryW = 20
 	}
-	sep := "  " + strings.Repeat("─", fixedW+colSummary-indent)
 
-	sb.WriteString(sep + "\n")
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("  %-*s%-*s  %-*s  %-*s  %s",
-		markW, "",
-		colKey, "KEY",
-		colAssignee, "ASSIGNEE",
-		colSP, "SP",
-		"SUMMARY",
-	)) + "\n")
-	sb.WriteString(sep + "\n")
+	t := table.NewWriter()
+	t.SetStyle(table.StyleRounded)
+	if len(style.header) > 0 {
+		t.Style().Color.Header = style.header
+	}
+	if len(style.row) > 0 {
+		t.Style().Color.Row = style.row
+	}
+	if len(style.border) > 0 {
+		t.Style().Color.Border = style.border
+	}
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, WidthMax: 1},
+		{Number: 2, WidthMax: 11},
+		{Number: 3, WidthMax: 16},
+		{Number: 4, WidthMax: 16},
+		{Number: 5, WidthMax: 8},
+		{Number: 6, WidthMax: 4},
+		{Number: 7, WidthMax: summaryW},
+	})
+	t.AppendHeader(table.Row{"", "KEY", "ASSIGNEE", "STATUS", "PRIORITY", "SP", "SUMMARY"})
 
 	for _, iss := range issues {
-		mark := "  "
+		mark := ""
 		if addedKeys != nil && addedKeys[iss.Key] {
-			mark = "+ "
+			mark = "+"
 		}
-		spStr := "  — "
+		sp := "—"
 		if iss.FinalSP != nil {
-			spStr = fmt.Sprintf("%-4s", formatSP(*iss.FinalSP))
+			sp = formatSP(*iss.FinalSP)
 		}
-		row := fmt.Sprintf("  %s%-*s  %-*s  %-*s  %s",
+		priority := iss.Priority
+		if priority == "" {
+			priority = "—"
+		}
+		t.AppendRow(table.Row{
 			mark,
-			colKey, truncStr(iss.Key, colKey),
-			colAssignee, truncStr(iss.Assignee, colAssignee),
-			colSP, spStr,
-			truncStr(iss.Summary, colSummary),
-		)
-		sb.WriteString(normalStyle.Render(row) + "\n")
+			iss.Key,
+			iss.Assignee,
+			iss.Status,
+			priority,
+			sp,
+			iss.Summary,
+		})
 	}
-	sb.WriteString(sep + "\n\n")
+
+	for _, line := range strings.Split(t.Render(), "\n") {
+		if line != "" {
+			sb.WriteString("  " + line + "\n")
+		}
+	}
+	sb.WriteString("\n")
 	return sb.String()
 }
 

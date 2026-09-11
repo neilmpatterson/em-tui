@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	gojira "github.com/andygrunwald/go-jira"
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,14 +21,15 @@ var ErrNoActiveSprint = errors.New("no active sprint")
 
 // Section keys used to route SprintIssuesResult messages.
 const (
-	SectionBugs       = "bugs"
-	SectionSecurity   = "security"
-	SectionTriage     = "triage"
-	SectionInProgress = "inprogress"
-	SectionDone       = "done"
-	SectionStuck      = "stuck"
-	SectionWatch      = "watchstatus"
-	SectionMidSprint  = "midsprint"
+	SectionBugs        = "bugs"
+	SectionSecurity    = "security"
+	SectionTriage      = "triage"
+	SectionInProgress  = "inprogress"
+	SectionDone        = "done"
+	SectionStuck       = "stuck"
+	SectionWatch       = "watchstatus"
+	SectionMidSprint   = "midsprint"
+	SectionStatsHistory = "stats_history"
 )
 
 type Client struct {
@@ -271,6 +273,17 @@ func (c *Client) FetchBoardSprintIssues(boardID, sprintID int) tea.Cmd {
 	}
 }
 
+// FetchHistoricalIssues fetches all Done issues assigned to accountID in the last
+// months months. Used by the Stats screen for the 18-month ticket breakdown.
+func (c *Client) FetchHistoricalIssues(accountID string, months int) tea.Cmd {
+	since := time.Now().AddDate(0, -months, 0).Format("2006-01-02")
+	jql := fmt.Sprintf(
+		`assignee = "%s" AND statusCategory = Done AND updated >= "%s" ORDER BY updated DESC`,
+		accountID, since,
+	)
+	return c.FetchAllIssuesByJQL(SectionStatsHistory, jql)
+}
+
 // FetchAllIssuesByJQL fetches all issues for a JQL query, paginating automatically.
 func (c *Client) FetchAllIssuesByJQL(section, jql string) tea.Cmd {
 	return func() tea.Msg {
@@ -293,7 +306,7 @@ func (c *Client) searchAllIssues(jql string) ([]domain.JiraIssue, error) {
 		reqBody := map[string]any{
 			"jql":        jql,
 			"maxResults": pageSize,
-			"fields":     []string{"summary", "status", "priority", "assignee", "updated", "created"},
+			"fields":     []string{"summary", "status", "priority", "assignee", "updated", "created", "issuetype"},
 		}
 		if nextPageToken != "" {
 			reqBody["nextPageToken"] = nextPageToken
@@ -351,7 +364,7 @@ func (c *Client) searchIssues(jql string, maxResults int) ([]domain.JiraIssue, e
 	body, _ := json.Marshal(map[string]any{
 		"jql":        jql,
 		"maxResults": maxResults,
-		"fields":     []string{"summary", "status", "priority", "assignee", "updated", "created"},
+		"fields":     []string{"summary", "status", "priority", "assignee", "updated", "created", "issuetype"},
 	})
 
 	req, err := http.NewRequest("POST", c.baseURL+"/rest/api/3/search/jql", bytes.NewReader(body))
@@ -405,6 +418,9 @@ type issueJSON struct {
 		Priority struct {
 			Name string `json:"name"`
 		} `json:"priority"`
+		IssueType struct {
+			Name string `json:"name"`
+		} `json:"issuetype"`
 		Assignee *struct {
 			DisplayName string `json:"displayName"`
 		} `json:"assignee"`
@@ -424,6 +440,7 @@ func (i issueJSON) toDomain() domain.JiraIssue {
 		Status:         i.Fields.Status.Name,
 		StatusCategory: i.Fields.Status.StatusCategory.Name,
 		Priority:       i.Fields.Priority.Name,
+		IssueType:      i.Fields.IssueType.Name,
 		Assignee:       assignee,
 		Updated:        truncateDate(i.Fields.Updated),
 		Created:        truncateDate(i.Fields.Created),
@@ -604,6 +621,7 @@ type ghIssueJSON struct {
 	Summary           string `json:"summary"`
 	AssigneeName      string `json:"assigneeName"`
 	StatusName        string `json:"statusName"`
+	PriorityName      string `json:"priorityName"`
 	EstimateStatistic struct {
 		StatFieldValue *struct {
 			Value *float64 `json:"value"`
@@ -637,6 +655,7 @@ func (g ghIssueJSON) toCompact(spMap map[string]float64) domain.SprintIssueCompa
 		Summary:   g.Summary,
 		Assignee:  g.AssigneeName,
 		Status:    g.StatusName,
+		Priority:  g.PriorityName,
 		InitialSP: initialSP,
 		FinalSP:   finalSP,
 	}

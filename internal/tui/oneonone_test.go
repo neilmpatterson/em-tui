@@ -60,7 +60,7 @@ func TestPhaseOf(t *testing.T) {
 		{"11297", "On Hold", domain.PhaseDone},
 	}
 	for _, c := range cases {
-		if got := m.phaseOf(c.id, c.name); got != c.want {
+		if got := m.fc().phaseOf(c.id, c.name); got != c.want {
 			t.Errorf("phaseOf(%q, %q) = %v, want %v", c.id, c.name, got, c.want)
 		}
 	}
@@ -69,7 +69,7 @@ func TestPhaseOf(t *testing.T) {
 func TestPhaseOfUnknownStatusIsNotSilentlyBucketed(t *testing.T) {
 	m := testModel()
 	// Unknown ID, unrecognised name, In Progress category by fallback.
-	if got := m.phaseOf("99999", "Spike"); got != domain.PhaseUnknown {
+	if got := m.fc().phaseOf("99999", "Spike"); got != domain.PhaseUnknown {
 		t.Errorf("phaseOf unknown = %v, want PhaseUnknown", got)
 	}
 }
@@ -96,7 +96,7 @@ func TestIssueCyclePhaseAttribution(t *testing.T) {
 			tr(15, "10004", "Testing", "10006", "Ready to Deploy"),
 		},
 	}
-	c, unknown := m.issueCycle(cl, false, day(20))
+	c, unknown := m.fc().issueCycle(cl, false, day(20))
 	if len(unknown) != 0 {
 		t.Errorf("unexpected unknown statuses: %v", unknown)
 	}
@@ -142,7 +142,7 @@ func TestIssueCycleReworkSplit(t *testing.T) {
 			tr(10, "3", "In Progress", "10522", "Closed"),
 		},
 	}
-	c, _ := m.issueCycle(cl, false, day(20))
+	c, _ := m.fc().issueCycle(cl, false, day(20))
 	if c.QABounces != 1 {
 		t.Errorf("QABounces = %d, want 1", c.QABounces)
 	}
@@ -174,7 +174,7 @@ func TestIssueCycleStopsAtFirstDone(t *testing.T) {
 			tr(45, "11036", "Deployment In Progress", "10522", "Closed"),
 		},
 	}
-	c, _ := m.issueCycle(cl, false, day(60))
+	c, _ := m.fc().issueCycle(cl, false, day(60))
 	if c.CycleDays != 2 {
 		t.Errorf("CycleDays = %v, want 2 (day 1 -> day 3), not 44", c.CycleDays)
 	}

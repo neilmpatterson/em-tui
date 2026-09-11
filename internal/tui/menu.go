@@ -187,7 +187,7 @@ func (m MainMenuModel) activatePersonDetail() (MainMenuModel, tea.Cmd) {
 	case pdPerfReview:
 		return m, func() tea.Msg { return NavigateTo{Screen: ScreenPerfReview, Payload: p} }
 	case pdStats:
-		// stub — no-op for now
+		return m, func() tea.Msg { return NavigateTo{Screen: ScreenStats, Payload: p} }
 	case pdDelete:
 		if m.confirmMsg == "" {
 			m.confirmMsg = "Press enter again to confirm removing member"

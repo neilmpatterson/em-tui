@@ -212,6 +212,7 @@ func (m Model) updateTeamEdit(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.step = stepTeamOverview
 		}
 	case "esc":
+		m = m.saveTeamDraft()
 		m.step = stepTeamOverview
 	}
 	return m, nil

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,67 @@ func expandTilde(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+// CommitDirResult is the message returned by FetchCommitDirs.
+type CommitDirResult struct {
+	AccountID string
+	Dirs      []domain.DirStat
+	Err       error
+}
+
+// FetchCommitDirs returns a Cmd that groups commits by top-level directory for
+// authorEmail in repoPath since sinceDate. Uses --numstat to get per-file paths.
+func FetchCommitDirs(accountID, repoPath, authorEmail string, since time.Time) tea.Cmd {
+	return func() tea.Msg {
+		repoPath = expandTilde(repoPath)
+		args := []string{
+			"-C", repoPath,
+			"log",
+			"--all",
+			"--author=" + authorEmail,
+			"--since=" + since.Format("2006-01-02"),
+			"--pretty=format:COMMIT",
+			"--numstat",
+		}
+		out, err := exec.Command("git", args...).Output()
+		if err != nil {
+			return CommitDirResult{AccountID: accountID, Err: err}
+		}
+		counts := make(map[string]int)
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line == "" || line == "COMMIT" {
+				continue
+			}
+			// numstat lines: "<added>\t<deleted>\t<path>"
+			parts := strings.SplitN(line, "\t", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			path := parts[2]
+			if path == "" {
+				continue
+			}
+			// Use up to two path segments so "engines/calendar_manager/foo.rb"
+			// groups as "engines/calendar_manager" rather than just "engines".
+			segs := strings.SplitN(path, "/", 3)
+			var dir string
+			if len(segs) >= 3 {
+				dir = segs[0] + "/" + segs[1]
+			} else if len(segs) == 2 {
+				dir = segs[0]
+			} else {
+				dir = segs[0]
+			}
+			counts[dir]++
+		}
+		dirs := make([]domain.DirStat, 0, len(counts))
+		for d, c := range counts {
+			dirs = append(dirs, domain.DirStat{Dir: d, Commits: c})
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Commits > dirs[j].Commits })
+		return CommitDirResult{AccountID: accountID, Dirs: dirs}
+	}
 }
 
 // FetchCommits returns a Cmd that reads git log for authorEmail in repoPath since sinceDate.
