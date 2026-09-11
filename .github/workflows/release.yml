@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build and release binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+          cache: true
+
+      - name: Build linux/amd64
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o em-tui-linux-amd64 ./cmd/em-tui
+
+      - name: Build darwin/amd64
+        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o em-tui-darwin-amd64 ./cmd/em-tui
+
+      - name: Build darwin/arm64
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o em-tui-darwin-arm64 ./cmd/em-tui
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            em-tui-linux-amd64
+            em-tui-darwin-amd64
+            em-tui-darwin-arm64
