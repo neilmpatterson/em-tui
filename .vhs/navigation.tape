@@ -1,9 +1,7 @@
-Output docs/navigation.gif
-
-Set Shell "bash"
-Set Width 120
-Set Height 36
-Set FontSize 14
+Set Shell zsh
+Set Width 1200
+Set Height 600
+Set FontSize 13
 Set Theme "Catppuccin Mocha"
 
 Type "go run ./cmd/em-tui --demo"
