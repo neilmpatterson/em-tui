@@ -722,16 +722,6 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-func truncStr(s string, maxLen int) string {
-	if maxLen < 3 {
-		return s
-	}
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-1] + "…"
-}
-
 func sortByWorkflow(counts map[string]int) []string {
 	rank := make(map[string]int, len(workflowOrder))
 	for i, s := range workflowOrder {

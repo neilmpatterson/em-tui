@@ -144,11 +144,6 @@ func (m OneOnOneModel) loading() bool {
 }
 
 func (m OneOnOneModel) Init() tea.Cmd {
-	if m.jiraClient == nil {
-		m.state = ooStateError
-		m.errMsg = "Jira client not configured."
-		return nil
-	}
 	since := time.Now().AddDate(0, 0, -56) // 8 weeks
 	// Use email for git --author filter; fall back to display name if email not set.
 	authorFilter := m.member.Email

@@ -118,12 +118,6 @@ func NewStats(cfg *config.Config, teamIdx int, jiraClient *jira.Client, memberId
 }
 
 func (m StatsModel) Init() tea.Cmd {
-	if m.jiraClient == nil {
-		m.state = statsStateError
-		m.errMsg = "Jira client not configured."
-		return nil
-	}
-
 	var cmds []tea.Cmd
 
 	// 1. 18-month historical issues (cached 4h; loads from cache or Jira).
